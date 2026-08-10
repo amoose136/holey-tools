@@ -398,7 +398,8 @@ class MESH_OT_holey_tools_resize_hole(
 
         bm = bmesh.from_edit_mesh(self._object.data)
         bm.faces.ensure_lookup_table()
-        self._bvh = BVHTree.FromBMesh(bm)
+        if self._bvh is None:
+            self._bvh = BVHTree.FromBMesh(bm)
 
         # Modal operators launched from the N-panel retain that UI region in
         # context. Convert window coordinates explicitly into the View3D WINDOW
@@ -844,6 +845,7 @@ class MESH_OT_holey_tools_resize_hole(
             _persistent_preview = None
         bm = bmesh.from_edit_mesh(self._object.data)
         bm.faces.ensure_lookup_table()
+        self._bvh = BVHTree.FromBMesh(bm)
         self._initial_selection = {face.index for face in bm.faces if face.select}
         self._original_vertex_coords = None
         self._proportional_weights = None
