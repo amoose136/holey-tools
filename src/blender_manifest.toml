@@ -6,6 +6,7 @@ name = "Holey Tools"
 tagline = "Resize mesh holes to precise diameters"
 maintainer = "Amos Manneschmidt <amoose136@gmail.com>"
 type = "add-on"
+website = "https://github.com/amoose136/holey-tools"
 tags = ["Mesh", "Modeling"]
 blender_version_min = "5.2.0"
 license = [
