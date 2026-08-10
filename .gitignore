@@ -1,0 +1,26 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Blender backup and recovery files
+*.blend[0-9]
+*.blend@
+
+# Extension build output
+/build/
+/dist/
+*.zip
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
