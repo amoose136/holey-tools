@@ -226,6 +226,17 @@ class GpuPreviewMixin:
         if region is None or region_data is None:
             return
 
+        # SpaceView3D draw handlers run for every 3D viewport. Restrict this
+        # overlay to the WINDOW region where the operator was invoked so split
+        # views and other windows do not receive a duplicate preview.
+        target_region = getattr(self, "_region", None)
+        if target_region is not None:
+            try:
+                if region.as_pointer() != target_region.as_pointer():
+                    return
+            except ReferenceError:
+                return
+
         projected_triangles = self._project_triangles(region, region_data)
         if not projected_triangles:
             return
