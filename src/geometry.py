@@ -97,7 +97,18 @@ class GeometryMixin:
             else:
                 selected_world = [matrix_world @ vert.co for vert in selected_verts]
                 projected = tool_settings.use_proportional_projected
-                view_matrix = context.region_data.view_matrix if projected else None
+                region_data = getattr(self, "_region_data", None)
+                if region_data is None:
+                    region_data = getattr(context, "region_data", None)
+                if region_data is None:
+                    space_data = getattr(context, "space_data", None)
+                    if getattr(space_data, "type", None) == 'VIEW_3D':
+                        region_data = space_data.region_3d
+                if projected and region_data is None:
+                    raise RuntimeError(
+                        "Projected proportional editing requires an active 3D view"
+                    )
+                view_matrix = region_data.view_matrix if projected else None
                 if projected:
                     selected_world = [
                         Vector((view_point.x, view_point.y, 0.0))
