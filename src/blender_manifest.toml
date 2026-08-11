@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "holey_tools"
-version = "0.9.1"
+version = "0.9.2"
 name = "Holey Tools"
 tagline = "Resize mesh holes to precise diameters"
 maintainer = "Amos Manneschmidt <amoose136@gmail.com>"
@@ -23,4 +23,5 @@ paths_exclude_pattern = [
   "/*.zip",
   "*.md",
   "docs",
+  "LICENSE",
 ]
