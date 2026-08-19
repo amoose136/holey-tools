@@ -20,6 +20,8 @@ contains one tool: **Resize Hole**.
 5. Type a diameter or drag the on-screen handle. Hold Shift for fine adjustment.
    Ctrl temporarily inverts Blender's snapping toggle; snapped changes use 0.1 mm
    increments.
+   Viewport navigation remains available from the middle mouse button, trackpad,
+   mouse wheel, or 3D mouse while the tool is active.
 6. Click away from the handle or press Enter to finish. Press Esc to cancel.
 
 The tool respects Blender's proportional-editing toggle, radius, falloff, connected

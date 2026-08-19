@@ -9,14 +9,131 @@ import bpy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.gpu_preview import (  # noqa: E402
-    DIAMETER_SYMBOL,
-    _convex_hull_lines,
+from src.constants import DIAMETER_SYMBOL  # noqa: E402
+from src.gpu_preview import _convex_hull_lines  # noqa: E402
+from src.operator import (  # noqa: E402
+    MESH_OT_holey_tools_resize_hole,
+    _is_view_navigation_event,
 )
-from src.operator import MESH_OT_holey_tools_resize_hole  # noqa: E402
 
 
 assert ord(DIAMETER_SYMBOL) == 0x00D8, repr(DIAMETER_SYMBOL)
+
+for navigation_event in (
+    'MIDDLEMOUSE',
+    'TRACKPADPAN',
+    'TRACKPADZOOM',
+    'MOUSEROTATE',
+    'NDOF_MOTION',
+    'NDOF_BUTTON_FIT',
+):
+    assert _is_view_navigation_event(navigation_event), navigation_event
+assert not _is_view_navigation_event('LEFTMOUSE')
+modal_context = SimpleNamespace(area=SimpleNamespace(type='VIEW_3D'))
+for navigation_event in ('TRACKPADPAN', 'NDOF_MOTION'):
+    assert MESH_OT_holey_tools_resize_hole.modal(
+        SimpleNamespace(),
+        modal_context,
+        SimpleNamespace(type=navigation_event),
+    ) == {'PASS_THROUGH'}
+assert MESH_OT_holey_tools_resize_hole.modal(
+    SimpleNamespace(),
+    modal_context,
+    SimpleNamespace(type='Z'),
+) == {'PASS_THROUGH'}
+
+angle_context = SimpleNamespace(
+    scene=SimpleNamespace(holey_tools_flood_angle=math.radians(60.0))
+)
+angle_operator = SimpleNamespace(
+    flood_angle=math.radians(60.0),
+    _angle_numeric_input="60.0",
+    _angle_numeric_replace=True,
+    _show_flood_angle_hud=lambda _context: None,
+    _rebuild_hover=lambda _context: None,
+    _set_status_text=lambda _context: None,
+)
+angle_operator._update_flood_angle_numeric_preview = lambda context: (
+    MESH_OT_holey_tools_resize_hole._update_flood_angle_numeric_preview(
+        angle_operator, context
+    )
+)
+assert not MESH_OT_holey_tools_resize_hole._handle_flood_angle_numeric_event(
+    angle_operator,
+    angle_context,
+    SimpleNamespace(
+        type='LEFTMOUSE',
+        value='PRESS',
+        ascii='',
+        ctrl=False,
+        alt=False,
+    ),
+)
+for event_type, character in (('FOUR', '4'), ('FIVE', '5')):
+    assert MESH_OT_holey_tools_resize_hole._handle_flood_angle_numeric_event(
+        angle_operator,
+        angle_context,
+        SimpleNamespace(
+            type=event_type,
+            value='PRESS',
+            ascii=character,
+            ctrl=False,
+            alt=False,
+        ),
+    )
+assert abs(math.degrees(angle_operator.flood_angle) - 45.0) < 1.0e-6
+assert (
+    angle_context.scene.holey_tools_flood_angle == angle_operator.flood_angle
+)
+
+diameter_context = SimpleNamespace(
+    scene=SimpleNamespace(
+        unit_settings=SimpleNamespace(system='METRIC', scale_length=1.0)
+    )
+)
+diameter_operator = SimpleNamespace(
+    diameter=0.010,
+    _format_diameter=lambda _context: "formatted",
+    _build_cylinder_preview=lambda _context: None,
+    _apply_diameter_to_mesh=lambda _context: None,
+    _set_status_text=lambda _context: None,
+)
+diameter_operator._scene_unit_info = lambda context: (
+    MESH_OT_holey_tools_resize_hole._scene_unit_info(context)
+)
+diameter_operator._step_diameter = lambda context, direction, fine: (
+    MESH_OT_holey_tools_resize_hole._step_diameter(
+        diameter_operator, context, direction, fine
+    )
+)
+assert MESH_OT_holey_tools_resize_hole._handle_diameter_step_event(
+    diameter_operator,
+    diameter_context,
+    SimpleNamespace(type='EQUAL', value='PRESS', shift=False),
+)
+assert abs(diameter_operator.diameter - 0.011) < 1.0e-9
+assert MESH_OT_holey_tools_resize_hole._handle_diameter_step_event(
+    diameter_operator,
+    diameter_context,
+    SimpleNamespace(type='MINUS', value='PRESS', shift=True),
+)
+assert abs(diameter_operator.diameter - 0.0109) < 1.0e-9
+
+# Hit testing must be relative to the saved View3D WINDOW region. Modal
+# operators invoked from the sidebar receive misleading mouse_region values.
+gizmo_owner = SimpleNamespace(
+    _gizmo_rect=(10.0, 20.0, 30.0, 40.0),
+    _region=SimpleNamespace(x=100, y=200),
+)
+gizmo_event = SimpleNamespace(
+    mouse_x=120,
+    mouse_y=230,
+    mouse_region_x=-500,
+    mouse_region_y=-500,
+)
+assert MESH_OT_holey_tools_resize_hole._event_over_drag_gizmo(
+    gizmo_owner, gizmo_event
+)
 
 
 hull_lines = _convex_hull_lines(

@@ -5,6 +5,7 @@
 
 import json
 import math
+import time
 
 import bmesh
 import bpy
@@ -14,14 +15,24 @@ from bpy_extras import view3d_utils
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
-from .constants import ADDON_VERSION, DIAMETER_ESTIMATOR_ITEMS
+from .constants import (
+    ADDON_VERSION,
+    DIAMETER_ESTIMATOR_ITEMS,
+    FLOOD_ANGLE_HUD_SECONDS,
+    VIEW_NAVIGATION_EVENTS,
+)
 from .geometry import GeometryMixin
-from .gpu_preview import GpuPreviewMixin
+from .gpu_preview import GpuPreviewMixin, _ui_scale
 
 
 _modal_active = False
 _draw_handles = set()
 _persistent_preview = None
+
+
+def _is_view_navigation_event(event_type):
+    """Return whether Blender should receive an event for viewport navigation."""
+    return event_type in VIEW_NAVIGATION_EVENTS or event_type.startswith('NDOF_')
 
 
 class _PersistentPreview:
@@ -232,6 +243,10 @@ class MESH_OT_holey_tools_resize_hole(
     _drag_start_x = 0
     _drag_start_diameter = 0.0
     _gizmo_rect = None
+    _flood_angle_hud_state = None
+    _mouse_position = None
+    _angle_numeric_input = ""
+    _angle_numeric_replace = True
 
     @classmethod
     def poll(cls, context):
@@ -338,16 +353,26 @@ class MESH_OT_holey_tools_resize_hole(
                 if count
                 else "No face under cursor"
             )
-            context.workspace.status_text_set(
-                f"Holey Tools {ADDON_VERSION}  •  {candidate_status}  •  "
-                f"[ / ] Flood Angle: {angle:.1f}°  •  "
-                "Click: apply and adjust  •  Esc: cancel"
-            )
+
+            def draw_status(header, _context):
+                row = header.layout.row(align=True)
+                row.alignment = 'LEFT'
+                row.label(text=f"Holey Tools {ADDON_VERSION}  •  {candidate_status}  •")
+                row.label(text="", icon='EVENT_LEFTBRACKET')
+                row.label(text="/")
+                row.label(text="", icon='EVENT_RIGHTBRACKET')
+                row.label(
+                    text=f"Flood Angle: {angle:.1f}°  •  "
+                    "Type: set angle  •  Click: apply and adjust  •  Esc: cancel"
+                )
+
+            context.workspace.status_text_set(draw_status)
         else:
             context.workspace.status_text_set(
                 f"Diameter: {self._numeric_input}  •  Type to replace  •  "
+                "+/-: 1 mm (Shift: 0.1 mm)  •  "
                 "Drag handle: adjust  •  Ctrl: invert 0.1 mm snap  •  Shift: fine  •  "
-                "MMB/Wheel: navigate  •  "
+                "MMB/Wheel/Trackpad/3D Mouse: navigate  •  "
                 "Click/Enter: apply  •  Esc: cancel"
             )
 
@@ -382,8 +407,89 @@ class MESH_OT_holey_tools_resize_hole(
         minimum = math.radians(0.1)
         maximum = math.radians(89.9)
         self.flood_angle = min(maximum, max(minimum, self.flood_angle + direction * step))
+        self._angle_numeric_input = f"{math.degrees(self.flood_angle):.1f}"
+        self._angle_numeric_replace = True
+        context.scene.holey_tools_flood_angle = self.flood_angle
+        self._show_flood_angle_hud(context)
         self._rebuild_hover(context)
         self._set_status_text(context)
+
+    def _handle_flood_angle_numeric_event(self, context, event):
+        """Consume direct degree entry while choosing the flood selection."""
+        if event.value != 'PRESS':
+            return False
+
+        if event.ctrl and event.type == 'A':
+            self._angle_numeric_replace = True
+            return True
+
+        if event.type == 'BACK_SPACE':
+            if self._angle_numeric_replace:
+                self._angle_numeric_input = ""
+                self._angle_numeric_replace = False
+            else:
+                self._angle_numeric_input = self._angle_numeric_input[:-1]
+            self._update_flood_angle_numeric_preview(context)
+            return True
+
+        character = event.ascii
+        if not character and event.type.startswith('NUMPAD_'):
+            suffix = event.type.removeprefix('NUMPAD_')
+            if suffix.isdigit() and len(suffix) == 1:
+                character = suffix
+            elif suffix == 'PERIOD':
+                character = '.'
+
+        if not character or character not in "0123456789.," or event.ctrl or event.alt:
+            return False
+
+        if self._angle_numeric_replace:
+            self._angle_numeric_input = character
+            self._angle_numeric_replace = False
+        else:
+            self._angle_numeric_input += character
+        self._update_flood_angle_numeric_preview(context)
+        return True
+
+    def _update_flood_angle_numeric_preview(self, context):
+        """Apply valid direct degree input to the selection and angle HUD."""
+        try:
+            degrees = float(self._angle_numeric_input.replace(',', '.'))
+        except ValueError:
+            self._set_status_text(context)
+            return
+
+        degrees = min(89.9, max(0.1, degrees))
+        self.flood_angle = math.radians(degrees)
+        context.scene.holey_tools_flood_angle = self.flood_angle
+        self._show_flood_angle_hud(context)
+        self._rebuild_hover(context)
+        self._set_status_text(context)
+
+    def _show_flood_angle_hud(self, context):
+        """Show the flood-angle HUD and schedule one redraw after it expires."""
+        state = self._flood_angle_hud_state
+        state["until"] = time.monotonic() + FLOOD_ANGLE_HUD_SECONDS
+        self._tag_redraw(context)
+        if state["timer_running"]:
+            return
+
+        state["timer_running"] = True
+        area = context.area
+
+        def expire():
+            remaining = state["until"] - time.monotonic()
+            if remaining > 0.0:
+                return remaining
+            state["timer_running"] = False
+            try:
+                if area is not None:
+                    area.tag_redraw()
+            except ReferenceError:
+                pass
+            return None
+
+        bpy.app.timers.register(expire, first_interval=FLOOD_ANGLE_HUD_SECONDS)
 
     def _update_hover(self, context, event):
         """Ray-cast the pointer and update the non-destructive face flood.
@@ -592,6 +698,32 @@ class MESH_OT_holey_tools_resize_hole(
         self._apply_diameter_to_mesh(context)
         self._set_status_text(context)
 
+    def _step_diameter(self, context, direction, fine_adjustment=False):
+        """Step the live diameter by one millimeter, or a tenth with Shift."""
+        _system, scale = self._scene_unit_info(context)
+        millimeters = 0.1 if fine_adjustment else 1.0
+        step = millimeters * 0.001 / scale
+        self.diameter = max(1.0e-9, self.diameter + direction * step)
+        self._numeric_reference = self._format_diameter(context)
+        self._numeric_input = self._numeric_reference
+        self._numeric_replace = True
+        self._build_cylinder_preview(context)
+        self._apply_diameter_to_mesh(context)
+        self._set_status_text(context)
+
+    def _handle_diameter_step_event(self, context, event):
+        """Consume main-keyboard or numpad diameter step shortcuts."""
+        if event.value != 'PRESS':
+            return False
+        if event.type in {'PLUS', 'EQUAL', 'NUMPAD_PLUS'}:
+            direction = 1
+        elif event.type in {'MINUS', 'NUMPAD_MINUS'}:
+            direction = -1
+        else:
+            return False
+        self._step_diameter(context, direction, event.shift)
+        return True
+
     def _handle_numeric_event(self, context, event):
         """Consume keyboard events that edit the live diameter expression.
 
@@ -655,10 +787,11 @@ class MESH_OT_holey_tools_resize_hole(
         while Ctrl temporarily inverts that setting, and uses physical 0.1 mm
         increments independently of the scene's displayed unit scale.
         """
+        ui_scale = _ui_scale()
         delta = event.mouse_x - self._drag_start_x
-        if abs(delta) >= 3:
+        if abs(delta) >= 3.0 * ui_scale:
             self._drag_moved = True
-        divisor = 1000.0 if event.shift else 200.0
+        divisor = (1000.0 if event.shift else 200.0) * ui_scale
         diameter = self._drag_start_diameter * (2.0 ** (delta / divisor))
         snap_enabled = bool(context.scene.tool_settings.use_snap) != bool(event.ctrl)
         if snap_enabled:
@@ -753,7 +886,27 @@ class MESH_OT_holey_tools_resize_hole(
             self._finish_modal(context)
             return {'CANCELLED'}
 
-        if event.type == 'MOUSEMOVE':
+        region = getattr(self, "_region", None)
+        if region is not None and hasattr(event, "mouse_x"):
+            self._mouse_position = (
+                event.mouse_x - region.x,
+                event.mouse_y - region.y,
+            )
+            hud_state = getattr(self, "_flood_angle_hud_state", None)
+            if (
+                event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}
+                and hud_state
+                and time.monotonic() < hud_state["until"]
+            ):
+                self._tag_redraw(context)
+
+        # Navigation must be offered to Blender before text input or tool-state
+        # handling. Trackpad gestures and NDOF events are continuous event
+        # streams, rather than aliases for the mouse wheel or middle button.
+        if _is_view_navigation_event(event.type) or event.type == 'Z':
+            return {'PASS_THROUGH'}
+
+        if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
             if self._stage == 'SELECT':
                 self._update_hover(context, event)
             elif self._stage == 'CYLINDER' and self._drag_active:
@@ -773,6 +926,12 @@ class MESH_OT_holey_tools_resize_hole(
         ):
             direction = -1 if event.type == 'LEFT_BRACKET' else 1
             self._change_flood_angle(context, direction, event.shift)
+            return {'RUNNING_MODAL'}
+
+        elif (
+            self._stage == 'SELECT'
+            and self._handle_flood_angle_numeric_event(context, event)
+        ):
             return {'RUNNING_MODAL'}
 
         elif event.type in {'RIGHTMOUSE', 'ESC'}:
@@ -810,17 +969,14 @@ class MESH_OT_holey_tools_resize_hole(
                 self._end_modal_with_persistent_preview(context)
                 return self.execute(context)
 
-        elif self._stage == 'CYLINDER' and self._handle_numeric_event(context, event):
+        elif (
+            self._stage == 'CYLINDER'
+            and self._handle_diameter_step_event(context, event)
+        ):
             return {'RUNNING_MODAL'}
 
-        if event.type in {
-            'MIDDLEMOUSE',
-            'WHEELUPMOUSE',
-            'WHEELDOWNMOUSE',
-            'WHEELINMOUSE',
-            'WHEELOUTMOUSE',
-        }:
-            return {'PASS_THROUGH'}
+        elif self._stage == 'CYLINDER' and self._handle_numeric_event(context, event):
+            return {'RUNNING_MODAL'}
 
         return {'RUNNING_MODAL'}
 
@@ -863,10 +1019,13 @@ class MESH_OT_holey_tools_resize_hole(
         self._numeric_input = ""
         self._numeric_reference = ""
         self._numeric_replace = True
+        self._angle_numeric_input = f"{math.degrees(self.flood_angle):.1f}"
+        self._angle_numeric_replace = True
         self._drag_active = False
         self._drag_moved = False
         self._gizmo_rect = None
         self._mouse_entered_view = False
+        self._flood_angle_hud_state = {"until": 0.0, "timer_running": False}
         _modal_active = True
 
         self._region = next(
@@ -878,6 +1037,11 @@ class MESH_OT_holey_tools_resize_hole(
             _modal_active = False
             self.report({'WARNING'}, "Could not find the active 3D viewport")
             return {'CANCELLED'}
+
+        self._mouse_position = (
+            event.mouse_x - self._region.x,
+            event.mouse_y - self._region.y,
+        )
 
         self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
             self._draw_preview, (), 'WINDOW', 'POST_PIXEL'

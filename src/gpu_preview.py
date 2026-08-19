@@ -4,6 +4,7 @@
 """Screen-space GPU previews and the diameter drag gizmo."""
 
 import math
+import time
 import traceback
 from numbers import Integral
 
@@ -16,10 +17,33 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Matrix
 from mathutils.geometry import tessellate_polygon
 
-from .constants import ADDON_VERSION, FALLBACK_RETOPOLOGY_COLOR
+from .constants import ADDON_VERSION, DIAMETER_SYMBOL, FALLBACK_RETOPOLOGY_COLOR
 
 
-DIAMETER_SYMBOL = "\N{LATIN CAPITAL LETTER O WITH STROKE}"
+def _ui_scale():
+    """Return Blender's DPI-aware scale for custom interface elements."""
+    try:
+        return max(0.25, float(bpy.context.preferences.system.ui_scale))
+    except (AttributeError, TypeError, ValueError):
+        return 1.0
+
+
+def _line_width(base_width=2.0):
+    """Return a DPI-aware GPU line width using Blender's pixel recommendation."""
+    try:
+        pixel_size = max(1.0, float(bpy.context.preferences.system.pixel_size))
+    except (AttributeError, TypeError, ValueError):
+        pixel_size = 1.0
+    return base_width * pixel_size
+
+
+def _viewport_size(region):
+    """Return the active framebuffer dimensions, with a region-size fallback."""
+    try:
+        _x, _y, width, height = gpu.state.viewport_get()
+    except (AttributeError, TypeError, ValueError):
+        width, height = region.width, region.height
+    return max(1, width), max(1, height)
 
 
 def _face_retopology_colors():
@@ -218,9 +242,6 @@ class GpuPreviewMixin:
         5.2 backend behavior. GPU state is restored in ``finally`` before the
         optional cylinder dimension label is drawn.
         """
-        if not self._fill_coords:
-            return
-
         region = bpy.context.region
         region_data = bpy.context.region_data
         if region is None or region_data is None:
@@ -236,6 +257,12 @@ class GpuPreviewMixin:
                     return
             except ReferenceError:
                 return
+
+        if not self._fill_coords:
+            if self._stage == 'SELECT':
+                _fill_color, line_color = _face_retopology_colors()
+                self._draw_flood_angle_label(region, line_color)
+            return
 
         projected_triangles = self._project_triangles(region, region_data)
         if not projected_triangles:
@@ -289,8 +316,10 @@ class GpuPreviewMixin:
                 fill_batch.draw(fill_shader)
 
                 if line_batch is not None:
-                    line_shader.uniform_float("viewportSize", (width, height))
-                    line_shader.uniform_float("lineWidth", 2.0)
+                    line_shader.uniform_float(
+                        "viewportSize", _viewport_size(region)
+                    )
+                    line_shader.uniform_float("lineWidth", _line_width())
                     line_shader.uniform_float("color", line_color)
                     line_batch.draw(line_shader)
 
@@ -302,6 +331,133 @@ class GpuPreviewMixin:
 
         if self._stage == 'CYLINDER':
             self._draw_dimension_label(region, label_points, line_color)
+        elif self._stage == 'SELECT':
+            self._draw_flood_angle_label(region, line_color)
+
+    def _draw_flood_angle_label(self, region, color):
+        """Draw a transient angle readout and wedge beside the mouse cursor."""
+        state = getattr(self, "_flood_angle_hud_state", None)
+        if not state or time.monotonic() >= state["until"]:
+            return
+
+        font_id = 0
+        ui_scale = _ui_scale()
+        text = f"Flood Angle: {math.degrees(self.flood_angle):.1f}°"
+        blf.size(font_id, 16.0 * ui_scale)
+        width, height = blf.dimensions(font_id, text)
+
+        mouse_x, mouse_y = getattr(
+            self,
+            "_mouse_position",
+            (region.width * 0.5, region.height * 0.5),
+        )
+        margin = 8.0 * ui_scale
+        cursor_gap = 18.0 * ui_scale
+        wedge_gap = 7.0 * ui_scale
+        wedge_radius = 38.0 * ui_scale
+        block_width = max(width, wedge_radius * 2.0)
+        block_height = height + wedge_gap + wedge_radius * 2.0
+
+        block_x = mouse_x + cursor_gap
+        if block_x + block_width > region.width - margin:
+            block_x = mouse_x - cursor_gap - block_width
+        block_x = min(max(margin, block_x), region.width - block_width - margin)
+
+        block_y = mouse_y + cursor_gap
+        if block_y + block_height > region.height - margin:
+            block_y = mouse_y - cursor_gap - block_height
+        block_y = min(max(margin, block_y), region.height - block_height - margin)
+
+        text_x = block_x + (block_width - width) * 0.5
+        pivot = (
+            block_x + block_width * 0.5,
+            block_y + height + wedge_gap + wedge_radius,
+        )
+        self._draw_flood_angle_wedge(
+            region,
+            pivot,
+            wedge_radius,
+            self.flood_angle,
+            color,
+        )
+
+        blf.enable(font_id, blf.SHADOW)
+        blf.shadow(font_id, 5, 0.0, 0.0, 0.0, 0.9)
+        shadow_offset = max(1, round(ui_scale))
+        blf.shadow_offset(font_id, shadow_offset, -shadow_offset)
+        blf.color(font_id, color[0], color[1], color[2], 1.0)
+        blf.position(font_id, text_x, block_y, 0.0)
+        blf.draw(font_id, text)
+        blf.disable(font_id, blf.SHADOW)
+
+    @staticmethod
+    def _draw_flood_angle_wedge(region, pivot, radius, angle, color):
+        """Draw a normal threshold with green go and red no-go sectors."""
+        viewport_width = max(1, region.width)
+        viewport_height = max(1, region.height)
+
+        def to_ndc(point):
+            return (
+                2.0 * point[0] / viewport_width - 1.0,
+                2.0 * point[1] / viewport_height - 1.0,
+                0.0,
+            )
+
+        def sector(start, end, segments=12):
+            points = [
+                (
+                    pivot[0] + radius * math.cos(start + (end - start) * i / segments),
+                    pivot[1] + radius * math.sin(start + (end - start) * i / segments),
+                )
+                for i in range(segments + 1)
+            ]
+            triangles = []
+            for index in range(segments):
+                triangles.extend((pivot, points[index], points[index + 1]))
+            return [to_ndc(point) for point in triangles]
+
+        green_coords = sector(-angle, angle)
+        red_coords = sector(-math.pi * 0.5, -angle) + sector(angle, math.pi * 0.5)
+        green_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        red_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        green_batch = batch_for_shader(green_shader, 'TRIS', {"pos": green_coords})
+        red_batch = batch_for_shader(red_shader, 'TRIS', {"pos": red_coords})
+
+        upper = (
+            pivot[0] + radius * math.cos(angle),
+            pivot[1] + radius * math.sin(angle),
+        )
+        lower = (
+            pivot[0] + radius * math.cos(angle),
+            pivot[1] - radius * math.sin(angle),
+        )
+        reference = (pivot[0] - radius, pivot[1])
+        line_coords = [
+            to_ndc(point)
+            for point in (pivot, upper, pivot, lower, pivot, reference)
+        ]
+        line_shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+        line_batch = batch_for_shader(line_shader, 'LINES', {"pos": line_coords})
+
+        gpu.state.blend_set('ALPHA')
+        gpu.state.depth_test_set('NONE')
+        gpu.state.face_culling_set('NONE')
+        try:
+            with gpu.matrix.push_pop(), gpu.matrix.push_pop_projection():
+                gpu.matrix.load_identity()
+                gpu.matrix.load_projection_matrix(Matrix.Identity(4))
+                red_shader.uniform_float("color", (0.9, 0.12, 0.08, 0.12))
+                red_batch.draw(red_shader)
+                green_shader.uniform_float("color", (0.12, 0.8, 0.25, 0.18))
+                green_batch.draw(green_shader)
+                line_shader.uniform_float("viewportSize", _viewport_size(region))
+                line_shader.uniform_float("lineWidth", _line_width())
+                line_shader.uniform_float("color", color)
+                line_batch.draw(line_shader)
+        finally:
+            gpu.state.face_culling_set('NONE')
+            gpu.state.depth_test_set('NONE')
+            gpu.state.blend_set('NONE')
 
     def _draw_dimension_label(self, region, projected_points, color):
         """Draw the live diameter text, interaction hint, and optional gizmo.
@@ -319,57 +475,62 @@ class GpuPreviewMixin:
 
         font_id = 0
         editing = getattr(self, "_accepts_numeric_input", True)
+        ui_scale = _ui_scale()
         display_text = f"{DIAMETER_SYMBOL} {text}"
         hint_text = (
             "Type to change"
             if editing
             else "Change in Redo panel"
         )
-        blf.size(font_id, 16.0)
+        blf.size(font_id, 16.0 * ui_scale)
         width, height = blf.dimensions(font_id, display_text)
-        blf.size(font_id, 12.0)
+        blf.size(font_id, 12.0 * ui_scale)
         hint_width, hint_height = blf.dimensions(font_id, hint_text)
-        gizmo_width = 68.0
+        gizmo_width = 68.0 * ui_scale
         block_width = max(width, hint_width, gizmo_width if editing else 0.0)
         xs = [point[0] for point in projected_points]
         ys = [point[1] for point in projected_points]
-        x = max(xs) + 14.0
-        if x + block_width > region.width - 8.0:
-            x = max(8.0, min(xs) - block_width - 14.0)
-        total_height = hint_height + 4.0 + height
-        minimum_y = 30.0 if editing else 8.0
+        margin = 8.0 * ui_scale
+        label_gap = 14.0 * ui_scale
+        text_gap = 4.0 * ui_scale
+        x = max(xs) + label_gap
+        if x + block_width > region.width - margin:
+            x = max(margin, min(xs) - block_width - label_gap)
+        total_height = hint_height + text_gap + height
+        minimum_y = (30.0 if editing else 8.0) * ui_scale
         y = min(
-            region.height - total_height - 8.0,
+            region.height - total_height - margin,
             max(minimum_y, (min(ys) + max(ys)) * 0.5),
         )
 
         blf.enable(font_id, blf.SHADOW)
         blf.shadow(font_id, 5, 0.0, 0.0, 0.0, 0.9)
-        blf.shadow_offset(font_id, 1, -1)
-        blf.size(font_id, 12.0)
+        shadow_offset = max(1, round(ui_scale))
+        blf.shadow_offset(font_id, shadow_offset, -shadow_offset)
+        blf.size(font_id, 12.0 * ui_scale)
         blf.color(font_id, color[0], color[1], color[2], 0.8)
-        blf.position(font_id, x, y + height + 4.0, 0.0)
+        blf.position(font_id, x, y + height + text_gap, 0.0)
         blf.draw(font_id, hint_text)
-        blf.size(font_id, 16.0)
+        blf.size(font_id, 16.0 * ui_scale)
         blf.color(font_id, color[0], color[1], color[2], 1.0)
         blf.position(font_id, x, y, 0.0)
         blf.draw(font_id, display_text)
         blf.disable(font_id, blf.SHADOW)
 
         if editing:
-            gizmo_y = y - 14.0
+            gizmo_y = y - 14.0 * ui_scale
             self._gizmo_rect = (
-                x - 7.0,
-                gizmo_y - 10.0,
-                x + gizmo_width + 7.0,
-                gizmo_y + 10.0,
+                x - 7.0 * ui_scale,
+                gizmo_y - 10.0 * ui_scale,
+                x + gizmo_width + 7.0 * ui_scale,
+                gizmo_y + 10.0 * ui_scale,
             )
             GpuPreviewMixin._draw_drag_gizmo(
-                region, x, gizmo_y, gizmo_width, color
+                region, x, gizmo_y, gizmo_width, color, ui_scale
             )
 
     @staticmethod
-    def _draw_drag_gizmo(region, x, y, width, color):
+    def _draw_drag_gizmo(region, x, y, width, color, ui_scale=1.0):
         """Draw a screen-space bidirectional diameter drag handle.
 
         Pixel endpoints are converted to normalized-device coordinates and
@@ -378,16 +539,17 @@ class GpuPreviewMixin:
         """
         left = x
         right = x + width
-        inset = 8.0
-        arrow = 6.0
+        inset = 8.0 * ui_scale
+        arrow = 6.0 * ui_scale
+        tick = 4.0 * ui_scale
         pixel_lines = (
             (left + inset, y), (right - inset, y),
             (left, y), (left + arrow, y + arrow),
             (left, y), (left + arrow, y - arrow),
             (right, y), (right - arrow, y + arrow),
             (right, y), (right - arrow, y - arrow),
-            (left + inset, y - 4.0), (left + inset, y + 4.0),
-            (right - inset, y - 4.0), (right - inset, y + 4.0),
+            (left + inset, y - tick), (left + inset, y + tick),
+            (right - inset, y - tick), (right - inset, y + tick),
         )
         viewport_width = max(1, region.width)
         viewport_height = max(1, region.height)
@@ -407,9 +569,9 @@ class GpuPreviewMixin:
                 gpu.matrix.load_identity()
                 gpu.matrix.load_projection_matrix(Matrix.Identity(4))
                 shader.uniform_float(
-                    "viewportSize", (viewport_width, viewport_height)
+                    "viewportSize", _viewport_size(region)
                 )
-                shader.uniform_float("lineWidth", 2.0)
+                shader.uniform_float("lineWidth", _line_width())
                 shader.uniform_float("color", color)
                 batch.draw(shader)
         finally:
@@ -420,7 +582,14 @@ class GpuPreviewMixin:
         rect = self._gizmo_rect
         if rect is None:
             return False
+        region = getattr(self, "_region", None)
+        if region is not None:
+            x = event.mouse_x - region.x
+            y = event.mouse_y - region.y
+        else:
+            x = event.mouse_region_x
+            y = event.mouse_region_y
         return (
-            rect[0] <= event.mouse_region_x <= rect[2]
-            and rect[1] <= event.mouse_region_y <= rect[3]
+            rect[0] <= x <= rect[2]
+            and rect[1] <= y <= rect[3]
         )

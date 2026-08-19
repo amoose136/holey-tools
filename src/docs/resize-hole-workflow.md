@@ -82,9 +82,14 @@ The drag modifier behavior follows Blender's snap toggle:
 - Global snapping on: dragging snaps by default and Ctrl temporarily disables it.
 - Shift increases drag precision.
 
-The mouse wheel and middle mouse button pass through to Blender for viewport
-navigation. Clicking the on-screen gizmo can begin another drag without leaving
-numeric-input mode.
+The mouse wheel, middle mouse button, trackpad pan/rotate/zoom gestures, and 3D
+mouse events pass through to Blender for viewport navigation. The overlay is
+reprojected as the view changes. Clicking the on-screen gizmo can begin another
+drag without leaving numeric-input mode.
+
+The label, drag handle, hit target, drag sensitivity, and GPU line widths follow
+Blender's DPI-aware UI and pixel scales, so the interaction remains the same size
+on standard and high-density displays.
 
 ## 5. Commit, redo, and persistent preview
 
