@@ -8,6 +8,8 @@ import math
 ADDON_VERSION = "0.9.4"
 DIAMETER_SYMBOL = "\N{LATIN CAPITAL LETTER O WITH STROKE}"
 FLOOD_ANGLE_HUD_SECONDS = 3.0
+AXIS_FACE_ATTRIBUTE = "holey_axis_region"
+AXIS_NODE_GROUP_NAME = "Holey Tools Extract Axis"
 
 # End loops qualify for depth adjustment when their maximum point-to-plane
 # residual is small at both an absolute and component-relative scale. A separate

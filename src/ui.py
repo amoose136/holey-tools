@@ -7,7 +7,11 @@ import math
 
 import bpy
 
-from .constants import ADDON_VERSION, DIAMETER_ESTIMATOR_ITEMS
+from .constants import (
+    ADDON_VERSION,
+    AXIS_FACE_ATTRIBUTE,
+    DIAMETER_ESTIMATOR_ITEMS,
+)
 
 
 class VIEW3D_PT_holey_tools(bpy.types.Panel):
@@ -42,6 +46,19 @@ class VIEW3D_PT_holey_tools(bpy.types.Panel):
         )
         layout.label(text="Click wall: apply and adjust")
 
+        layout.separator()
+        layout.label(text="Geometry Nodes", icon='NODETREE')
+        layout.prop(
+            context.scene,
+            "holey_tools_axis_attribute",
+            text="Face Group",
+        )
+        extract = layout.operator("mesh.holey_tools_extract_axis")
+        extract.attribute_name = context.scene.holey_tools_axis_attribute
+        extract.flood_angle = context.scene.holey_tools_flood_angle
+        layout.label(text="Click region: extract principal axis")
+
+
 def register_properties():
     bpy.types.Scene.holey_tools_flood_angle = bpy.props.FloatProperty(
         name="Flood Angle",
@@ -57,6 +74,11 @@ def register_properties():
         items=DIAMETER_ESTIMATOR_ITEMS,
         default='AVERAGE',
     )
+    bpy.types.Scene.holey_tools_axis_attribute = bpy.props.StringProperty(
+        name="Axis Face Group",
+        description="Face-domain named attribute used by the Extract Axis node group",
+        default=AXIS_FACE_ATTRIBUTE,
+    )
 
 
 def unregister_properties():
@@ -64,3 +86,5 @@ def unregister_properties():
         del bpy.types.Scene.holey_tools_flood_angle
     if hasattr(bpy.types.Scene, "holey_tools_diameter_estimator"):
         del bpy.types.Scene.holey_tools_diameter_estimator
+    if hasattr(bpy.types.Scene, "holey_tools_axis_attribute"):
+        del bpy.types.Scene.holey_tools_axis_attribute

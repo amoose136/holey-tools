@@ -1,6 +1,7 @@
 # Holey Tools
 
-Holey Tools provides precision mesh-editing tools for holes. Version 0.9 currently contains one tool: **Resize Hole**.
+Holey Tools provides precision mesh-editing tools for holes. Version 0.9 contains
+**Resize Hole** and **Extract Axis**.
 
 ## Requirements
 
@@ -42,12 +43,41 @@ The tool respects Blender's proportional-editing toggle, radius, falloff, connec
 - Counterbore holes are not (yet) supported.
 - Holes capped by non-planar ends will not be handled well yet. For that, an upcoming non-destructive reconstruction mode is planned that will rebuild the surface without the hole and then build the hole with a boolean and a node tree.
 
+## Extract Axis
+
+1. Open **3D Viewport > Sidebar > Holey Tools** and find **Geometry Nodes**.
+2. Choose the face-group attribute name, then click **Extract Axis**.
+3. Hover the desired wall or surface region. The tint, `[` / `]` flood-angle
+   controls, direct angle entry, and viewport navigation work like Resize Hole.
+4. Click the region or press Enter to store it.
+
+The tool replaces a face-domain integer attribute (by default
+`holey_axis_region`) with the flooded selection and creates the reusable
+**Holey Tools Extract Axis** geometry node group. The wrapper appends and uses
+Blender's bundled **Geometry Principal Components** asset. Add the wrapper inside
+another Geometry Nodes tree and connect geometry containing the attribute. Its
+outputs are:
+
+- **Geometry**: input geometry joined with the center indicator.
+- **Indicator**: a separate low-poly icosphere placed at the analyzed center.
+- **Axis**: the outlying longest or shortest principal axis of the selected region.
+  Its sign is arbitrary, so either direction represents the same axis.
+- **Center**, **Rotation**, and **Principal Components**: values returned by the
+  bundled principal-components group.
+- **Valid**: true when the named attribute exists and selects at least one face.
+
+The **Face Group** string input defaults to the most recently extracted attribute
+name and can be changed per group-node instance. **Indicator Size** controls the
+icosphere radius. The tool does not add a modifier automatically.
+
 ## Source layout
 
 - `constants.py` contains version metadata, fallback colors, and shared UI options.
 - `geometry.py` contains cylinder fitting, flood fill, proportional weights, and mesh deformation.
 - `gpu_preview.py` contains screen-space tinting, cylinder drawing, labels, and the drag gizmos.
 - `operator.py` contains modal interaction, numeric input, redo state, and runtime cleanup.
+- `extract_axis.py` contains the face-group extraction modal operator.
+- `axis_nodes.py` wraps Blender's bundled Geometry Principal Components asset.
 - `ui.py` contains the sidebar panel and registered scene setting.
 - `__init__.py` is Blender's extension entry point and registers the operator and UI.
 
@@ -55,6 +85,7 @@ More detail is available in the developer documentation:
 
 - [Architecture](docs/architecture.md)
 - [Resize Hole workflow](docs/resize-hole-workflow.md)
+- [Extract Axis workflow](docs/extract-axis-workflow.md)
 
 ## License
 
