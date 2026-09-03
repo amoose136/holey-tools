@@ -14,7 +14,7 @@ from .ui import (
 bl_info = {
     "name": "Holey Tools",
     "author": "Amos Manneschmidt",
-    "version": (0, 9, 3),
+    "version": (0, 9, 4),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar > Holey Tools",
     "description": "Precision tools for editing holes in mesh objects",

@@ -35,6 +35,24 @@ def _is_view_navigation_event(event_type):
     return event_type in VIEW_NAVIGATION_EVENTS or event_type.startswith('NDOF_')
 
 
+def _update_diameter_estimator(operator, _context):
+    """Switch the fitted baseline and diameter when Redo changes estimator."""
+    if not operator.fit_valid:
+        return
+    radius = {
+        'MINIMUM': operator.fit_radius_minimum,
+        'AVERAGE': operator.fit_radius_average,
+        'MAXIMUM': operator.fit_radius_maximum,
+    }.get(operator.diameter_estimator, operator.fit_radius_average)
+    if radius <= 1.0e-12:
+        return
+    operator.fit_radius = radius
+    operator.diameter = radius * 2.0
+    fit = getattr(operator, "_fit", None)
+    if fit is not None:
+        fit["radius"] = radius
+
+
 class _PersistentPreview:
     """Own a post-modal GPU preview without retaining an Operator RNA object.
 
@@ -53,6 +71,10 @@ class _PersistentPreview:
         self._stage = 'CYLINDER'
         self._accepts_numeric_input = False
         self._numeric_input = operator._numeric_input
+        self._diameter_text = operator._diameter_text
+        self._depth_text = operator._depth_text
+        self._active_dimension = operator._active_dimension
+        self.depth_valid = operator.depth_valid
         self._draw_error_reported = False
         self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
             self._draw_preview, (), 'WINDOW', 'POST_PIXEL'
@@ -66,6 +88,10 @@ class _PersistentPreview:
         self._line_coords = list(operator._line_coords or ())
         self._stage = 'CYLINDER'
         self._numeric_input = operator._numeric_input
+        self._diameter_text = operator._diameter_text
+        self._depth_text = operator._depth_text
+        self._active_dimension = operator._active_dimension
+        self.depth_valid = operator.depth_valid
         if context.area is not None:
             context.area.tag_redraw()
 
@@ -148,7 +174,7 @@ class MESH_OT_holey_tools_resize_hole(
 
     The modal operator has two stages. SELECT ray-casts beneath the pointer and
     displays a non-destructive flood fill. A click locks that region, fits the
-    cylinder, and enters CYLINDER, where typing or dragging updates the diameter.
+    cylinder, and enters CYLINDER, where typing or dragging updates dimensions.
     Confirmation hands plain drawing data to ``_PersistentPreview`` so Blender's
     Redo panel can continue changing the completed operation safely.
     """
@@ -177,6 +203,14 @@ class MESH_OT_holey_tools_resize_hole(
         subtype='DISTANCE',
         unit='LENGTH',
     )
+    depth: bpy.props.FloatProperty(
+        name="Depth",
+        description="World-space distance between two planar hole-end centers",
+        default=0.0,
+        min=0.0,
+        subtype='DISTANCE',
+        unit='LENGTH',
+    )
     flood_angle: bpy.props.FloatProperty(
         name="Flood Angle",
         description="Maximum angle between neighboring faces in the hover flood fill",
@@ -190,7 +224,8 @@ class MESH_OT_holey_tools_resize_hole(
         description="How to estimate diameter when the selected wall has multiple radii",
         items=DIAMETER_ESTIMATOR_ITEMS,
         default='AVERAGE',
-        options={'HIDDEN', 'SKIP_SAVE'},
+        update=_update_diameter_estimator,
+        options={'SKIP_SAVE'},
     )
     fit_valid: bpy.props.BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
     fit_face_indices: bpy.props.StringProperty(
@@ -209,11 +244,20 @@ class MESH_OT_holey_tools_resize_hole(
         size=3, options={'HIDDEN', 'SKIP_SAVE'}
     )
     fit_radius: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    fit_radius_minimum: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    fit_radius_average: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    fit_radius_maximum: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_z_min: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_z_max: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    fit_is_stud: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_end_planes: bpy.props.StringProperty(
         default="", options={'HIDDEN', 'SKIP_SAVE'}
     )
+    depth_valid: bpy.props.BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
+    fit_depth_initial: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    fit_depth_outer: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    fit_depth_inner: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    fit_depth_outer_plane: bpy.props.IntProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
     _draw_handle = None
     _fill_batch = None
@@ -234,15 +278,21 @@ class MESH_OT_holey_tools_resize_hole(
     _mouse_entered_view = False
     _fit = None
     _end_planes = None
+    _depth_fit = None
     _stage = 'SELECT'
     _numeric_input = ""
     _numeric_reference = ""
     _numeric_replace = True
+    _diameter_text = ""
+    _depth_text = ""
+    _active_dimension = 'DIAMETER'
     _drag_active = False
     _drag_moved = False
     _drag_start_x = 0
-    _drag_start_diameter = 0.0
+    _drag_start_y = 0
+    _drag_start_value = 0.0
     _gizmo_rect = None
+    _gizmo_rects = None
     _flood_angle_hud_state = None
     _mouse_position = None
     _angle_numeric_input = ""
@@ -261,10 +311,13 @@ class MESH_OT_holey_tools_resize_hole(
         )
 
     def draw(self, context):
-        """Draw the Redo-panel UI and initially activate its diameter field."""
+        """Draw dimensions available in the Redo panel for the fitted wall."""
+        self.layout.prop(self, "diameter_estimator")
         row = self.layout.row()
         row.activate_init = True
         row.prop(self, "diameter")
+        if self.depth_valid:
+            self.layout.prop(self, "depth")
 
     @staticmethod
     def _tag_redraw(context):
@@ -368,10 +421,15 @@ class MESH_OT_holey_tools_resize_hole(
 
             context.workspace.status_text_set(draw_status)
         else:
+            active = self._active_dimension.title()
+            dimensions = f"Diameter: {self._diameter_text}"
+            if self.depth_valid:
+                dimensions += f"  •  Depth: {self._depth_text}"
             context.workspace.status_text_set(
-                f"Diameter: {self._numeric_input}  •  Type to replace  •  "
+                f"{dimensions}  •  Active: {active}  •  Type to replace  •  "
                 "+/-: 1 mm (Shift: 0.1 mm)  •  "
-                "Drag handle: adjust  •  Ctrl: invert 0.1 mm snap  •  Shift: fine  •  "
+                "Touch handle: select/adjust  •  Ctrl: invert 0.1 mm snap  •  "
+                "Shift: fine  •  "
                 "MMB/Wheel/Trackpad/3D Mouse: navigate  •  "
                 "Click/Enter: apply  •  Esc: cancel"
             )
@@ -577,19 +635,47 @@ class MESH_OT_holey_tools_resize_hole(
         self.fit_basis_y = fit["basis_y"]
         self.fit_center = fit["center"]
         self.fit_radius = fit["radius"]
+        estimates = fit["radius_estimates"]
+        self.fit_radius_minimum = estimates['MINIMUM']
+        self.fit_radius_average = estimates['AVERAGE']
+        self.fit_radius_maximum = estimates['MAXIMUM']
         self.fit_z_min = fit["z_min"]
         self.fit_z_max = fit["z_max"]
+        self.fit_is_stud = fit.get("is_stud", False)
         self.fit_end_planes = json.dumps(
             [
                 {
                     "verts": plane["verts"],
                     "point": list(plane["point"]),
                     "normal": list(plane["normal"]),
+                    "max_error": plane.get("max_error"),
+                    "tolerance": plane.get("tolerance"),
+                    "adjacent_normal": (
+                        list(plane["adjacent_normal"])
+                        if plane.get("adjacent_normal") is not None
+                        else None
+                    ),
                 }
                 for plane in (self._end_planes or ())
             ],
             separators=(",", ":"),
         )
+        self._depth_fit = self._fit_adjustable_depth(
+            self._end_planes or (), fit
+        )
+        self.depth_valid = self._depth_fit is not None
+        if self.depth_valid:
+            self.depth = self._depth_fit["initial"]
+            self.fit_depth_initial = self._depth_fit["initial"]
+            self.fit_depth_outer = self._depth_fit["outer_coordinate"]
+            self.fit_depth_inner = self._depth_fit["inner_coordinate"]
+            self.fit_depth_outer_plane = self._depth_fit["outer_plane_index"]
+        else:
+            self.depth = 0.0
+            self.fit_depth_initial = 0.0
+            self.fit_depth_outer = 0.0
+            self.fit_depth_inner = 0.0
+            self.fit_depth_outer_plane = 0
 
     def _restore_fit_for_redo(self):
         """Reconstruct transient fit state from hidden RNA redo properties.
@@ -612,8 +698,14 @@ class MESH_OT_holey_tools_resize_hole(
             "basis_y": Vector(self.fit_basis_y),
             "center": Vector(self.fit_center),
             "radius": self.fit_radius,
+            "radius_estimates": {
+                'MINIMUM': self.fit_radius_minimum,
+                'AVERAGE': self.fit_radius_average,
+                'MAXIMUM': self.fit_radius_maximum,
+            },
             "z_min": self.fit_z_min,
             "z_max": self.fit_z_max,
+            "is_stud": self.fit_is_stud,
         }
         try:
             self._end_planes = [
@@ -621,11 +713,35 @@ class MESH_OT_holey_tools_resize_hole(
                     "verts": plane["verts"],
                     "point": Vector(plane["point"]),
                     "normal": Vector(plane["normal"]),
+                    "max_error": plane.get("max_error", math.inf),
+                    "tolerance": plane.get("tolerance", 0.0),
+                    "adjacent_normal": (
+                        Vector(plane["adjacent_normal"])
+                        if plane.get("adjacent_normal") is not None
+                        else None
+                    ),
                 }
                 for plane in json.loads(self.fit_end_planes or "[]")
             ]
         except (TypeError, ValueError, KeyError):
             self._end_planes = []
+        if (
+            self.depth_valid
+            and len(self._end_planes) == 2
+            and self.fit_depth_initial > 1.0e-12
+            and self.fit_depth_outer_plane in {0, 1}
+        ):
+            self._depth_fit = {
+                "initial": self.fit_depth_initial,
+                "outer_coordinate": self.fit_depth_outer,
+                "inner_coordinate": self.fit_depth_inner,
+                "outer_plane_index": self.fit_depth_outer_plane,
+                "inner_plane_index": 1 - self.fit_depth_outer_plane,
+                "is_stud": self.fit_is_stud,
+            }
+        else:
+            self._depth_fit = None
+            self.depth_valid = False
         self._stage = 'CYLINDER'
         return True
 
@@ -637,21 +753,29 @@ class MESH_OT_holey_tools_resize_hole(
         scale = settings.scale_length if system != 'NONE' else 1.0
         return system, max(scale, 1.0e-12)
 
-    def _format_diameter(self, context):
-        """Format the internal world-space diameter using the scene's units."""
+    def _format_dimension(self, context, value):
+        """Format one internal world-space length using the scene's units."""
         system, scale = self._scene_unit_info(context)
         if system == 'NONE':
-            return f"{self.diameter:.6g}"
+            return f"{value:.6g}"
         return bpy.utils.units.to_string(
             system,
             'LENGTH',
-            self.diameter * scale,
+            value * scale,
             precision=6,
             split_unit=False,
             compatible_unit=True,
         )
 
-    def _parse_diameter(self, context, text):
+    def _format_diameter(self, context):
+        """Format the current diameter for numeric input and overlays."""
+        return self._format_dimension(context, self.diameter)
+
+    def _format_depth(self, context):
+        """Format the current depth for numeric input and overlays."""
+        return self._format_dimension(context, self.depth)
+
+    def _parse_dimension(self, context, text):
         """Parse user-entered dimension text into Blender world-space units.
 
         Explicit unit suffixes and the previous formatted unit are handled by
@@ -672,12 +796,56 @@ class MESH_OT_holey_tools_resize_hole(
         )
         return value / scale
 
-    def _begin_numeric_input(self, context):
-        """Seed direct entry from the fitted diameter and select it for replacement."""
-        self._numeric_reference = self._format_diameter(context)
+    def _parse_diameter(self, context, text):
+        """Retain the diameter parser name for compatibility with older redo state."""
+        return self._parse_dimension(context, text)
+
+    def _active_dimension_value(self):
+        """Return the value controlled by the most recently touched handle."""
+        if getattr(self, "_active_dimension", 'DIAMETER') == 'DEPTH':
+            return self.depth
+        return self.diameter
+
+    def _set_active_dimension_value(self, value):
+        """Assign the most recently touched dimension."""
+        if getattr(self, "_active_dimension", 'DIAMETER') == 'DEPTH':
+            self.depth = value
+        else:
+            self.diameter = value
+
+    def _sync_dimension_text(self, context):
+        """Refresh both overlay values while preserving active partial input."""
+        active = getattr(self, "_active_dimension", 'DIAMETER')
+        self._diameter_text = (
+            self._numeric_input
+            if active == 'DIAMETER'
+            else self._format_diameter(context)
+        )
+        self._depth_text = (
+            self._numeric_input
+            if active == 'DEPTH'
+            else self._format_depth(context)
+        ) if self.depth_valid else ""
+
+    def _activate_dimension(self, context, dimension):
+        """Make a handle the target for subsequent typing, stepping, and drag."""
+        if dimension == 'DEPTH' and not self.depth_valid:
+            dimension = 'DIAMETER'
+        self._active_dimension = dimension
+        self._numeric_reference = (
+            self._format_depth(context)
+            if dimension == 'DEPTH'
+            else self._format_diameter(context)
+        )
         self._numeric_input = self._numeric_reference
         self._numeric_replace = True
+        self._sync_dimension_text(context)
         self._set_status_text(context)
+        self._tag_redraw(context)
+
+    def _begin_numeric_input(self, context):
+        """Default direct entry to diameter until a handle is touched."""
+        self._activate_dimension(context, 'DIAMETER')
 
     def _update_numeric_preview(self, context):
         """Apply valid positive input immediately to the mesh and GPU cylinder.
@@ -686,33 +854,41 @@ class MESH_OT_holey_tools_resize_hole(
         not disturb the last valid geometry.
         """
         try:
-            value = self._parse_diameter(context, self._numeric_input)
+            value = self._parse_dimension(context, self._numeric_input)
         except (TypeError, ValueError):
+            self._sync_dimension_text(context)
             self._set_status_text(context)
             return
         if value <= 0.0:
+            self._sync_dimension_text(context)
             self._set_status_text(context)
             return
-        self.diameter = value
+        self._set_active_dimension_value(value)
+        self._sync_dimension_text(context)
         self._build_cylinder_preview(context)
         self._apply_diameter_to_mesh(context)
         self._set_status_text(context)
 
-    def _step_diameter(self, context, direction, fine_adjustment=False):
-        """Step the live diameter by one millimeter, or a tenth with Shift."""
+    def _step_dimension(self, context, direction, fine_adjustment=False):
+        """Step the active dimension by one millimeter, or a tenth with Shift."""
         _system, scale = self._scene_unit_info(context)
         millimeters = 0.1 if fine_adjustment else 1.0
         step = millimeters * 0.001 / scale
-        self.diameter = max(1.0e-9, self.diameter + direction * step)
-        self._numeric_reference = self._format_diameter(context)
+        self._set_active_dimension_value(
+            max(1.0e-9, self._active_dimension_value() + direction * step)
+        )
+        self._numeric_reference = self._format_dimension(
+            context, self._active_dimension_value()
+        )
         self._numeric_input = self._numeric_reference
         self._numeric_replace = True
+        self._sync_dimension_text(context)
         self._build_cylinder_preview(context)
         self._apply_diameter_to_mesh(context)
         self._set_status_text(context)
 
-    def _handle_diameter_step_event(self, context, event):
-        """Consume main-keyboard or numpad diameter step shortcuts."""
+    def _handle_dimension_step_event(self, context, event):
+        """Consume main-keyboard or numpad step shortcuts for the active value."""
         if event.value != 'PRESS':
             return False
         if event.type in {'PLUS', 'EQUAL', 'NUMPAD_PLUS'}:
@@ -721,11 +897,11 @@ class MESH_OT_holey_tools_resize_hole(
             direction = -1
         else:
             return False
-        self._step_diameter(context, direction, event.shift)
+        self._step_dimension(context, direction, event.shift)
         return True
 
     def _handle_numeric_event(self, context, event):
-        """Consume keyboard events that edit the live diameter expression.
+        """Consume keyboard events that edit the active dimension expression.
 
         Ctrl-A selects the whole logical field, Backspace removes input, and
         printable number/unit characters trigger immediate parsing and resizing.
@@ -773,44 +949,52 @@ class MESH_OT_holey_tools_resize_hole(
         self._update_numeric_preview(context)
         return True
 
-    def _begin_diameter_drag(self, event):
-        """Capture the pointer and diameter that anchor a drag adjustment."""
+    def _begin_dimension_drag(self, context, event, dimension):
+        """Activate a handle and capture the pointer/value anchoring its drag."""
+        self._activate_dimension(context, dimension)
         self._drag_active = True
         self._drag_moved = False
         self._drag_start_x = event.mouse_x
-        self._drag_start_diameter = self.diameter
+        self._drag_start_y = event.mouse_y
+        self._drag_start_value = self._active_dimension_value()
 
-    def _update_diameter_drag(self, context, event):
-        """Convert horizontal drag distance into a live exponential resize.
+    def _update_dimension_drag(self, context, event):
+        """Convert handle-aligned drag distance into a live exponential resize.
 
         Shift lowers sensitivity. Snapping follows Blender's global snap toggle,
         while Ctrl temporarily inverts that setting, and uses physical 0.1 mm
         increments independently of the scene's displayed unit scale.
         """
         ui_scale = _ui_scale()
-        delta = event.mouse_x - self._drag_start_x
+        if self._active_dimension == 'DEPTH':
+            delta = event.mouse_y - self._drag_start_y
+        else:
+            delta = event.mouse_x - self._drag_start_x
         if abs(delta) >= 3.0 * ui_scale:
             self._drag_moved = True
         divisor = (1000.0 if event.shift else 200.0) * ui_scale
-        diameter = self._drag_start_diameter * (2.0 ** (delta / divisor))
+        value = self._drag_start_value * (2.0 ** (delta / divisor))
         snap_enabled = bool(context.scene.tool_settings.use_snap) != bool(event.ctrl)
         if snap_enabled:
             # Blender stores length in scene units. Snap the physical result to
             # tenths of a millimeter regardless of the displayed unit system.
             _system, scale = self._scene_unit_info(context)
             snap_step = 0.0001 / scale
-            diameter = round(diameter / snap_step) * snap_step
-            diameter = max(snap_step, diameter)
-        self.diameter = max(1.0e-9, diameter)
-        self._numeric_reference = self._format_diameter(context)
+            value = round(value / snap_step) * snap_step
+            value = max(snap_step, value)
+        self._set_active_dimension_value(max(1.0e-9, value))
+        self._numeric_reference = self._format_dimension(
+            context, self._active_dimension_value()
+        )
         self._numeric_input = self._numeric_reference
         self._numeric_replace = True
+        self._sync_dimension_text(context)
         self._build_cylinder_preview(context)
         self._apply_diameter_to_mesh(context)
         self._set_status_text(context)
 
     def _lock_selection_and_fit(self, context, build_preview=True):
-        """Commit the hover region and initialize diameter-editing state.
+        """Commit the hover region and initialize dimension-editing state.
 
         The method fits the cylinder and boundary planes, makes the candidate
         faces Blender's real selection, captures original/proportional vertex
@@ -847,7 +1031,7 @@ class MESH_OT_holey_tools_resize_hole(
         return True
 
     def execute(self, context):
-        """Apply the stored diameter during confirmation or Redo execution.
+        """Apply stored dimensions during confirmation or Redo execution.
 
         Transient fit state is restored from RNA properties when necessary. If a
         persistent overlay exists, its geometry and label are refreshed from the
@@ -863,11 +1047,15 @@ class MESH_OT_holey_tools_resize_hole(
         # Rebuild on the current operator wrapper, then copy only plain Python GPU
         # data into the persistent preview. No RNA operator survives past redo.
         if _persistent_preview is not None:
-            # Redo-panel edits update the RNA diameter property directly rather
-            # than passing through modal numeric input. Keep the overlay text in
-            # sync with the value Blender just executed.
-            self._numeric_input = self._format_diameter(context)
+            # Redo-panel edits update RNA properties directly rather than passing
+            # through modal input. Keep both overlay values synchronized.
+            if self._active_dimension == 'DEPTH' and not self.depth_valid:
+                self._active_dimension = 'DIAMETER'
+            self._numeric_input = self._format_dimension(
+                context, self._active_dimension_value()
+            )
             self._numeric_reference = self._numeric_input
+            self._sync_dimension_text(context)
             self._build_cylinder_preview(context)
             _persistent_preview.update_from(self, context)
         return {'FINISHED'}
@@ -910,13 +1098,13 @@ class MESH_OT_holey_tools_resize_hole(
             if self._stage == 'SELECT':
                 self._update_hover(context, event)
             elif self._stage == 'CYLINDER' and self._drag_active:
-                self._update_diameter_drag(context, event)
+                self._update_dimension_drag(context, event)
             elif self._stage == 'CYLINDER':
-                cursor = (
-                    'SCROLL_X'
-                    if self._event_over_drag_gizmo(event)
-                    else 'CROSSHAIR'
-                )
+                hovered_dimension = self._dimension_gizmo_at_event(event)
+                cursor = {
+                    'DIAMETER': 'SCROLL_X',
+                    'DEPTH': 'SCROLL_Y',
+                }.get(hovered_dimension, 'CROSSHAIR')
                 context.window.cursor_modal_set(cursor)
 
         elif (
@@ -956,10 +1144,11 @@ class MESH_OT_holey_tools_resize_hole(
                 self._update_hover(context, event)
                 if not self._lock_selection_and_fit(context, build_preview=True):
                     return {'RUNNING_MODAL'}
-                self._begin_diameter_drag(event)
+                self._begin_dimension_drag(context, event, 'DIAMETER')
                 return {'RUNNING_MODAL'}
-            if self._event_over_drag_gizmo(event):
-                self._begin_diameter_drag(event)
+            touched_dimension = self._dimension_gizmo_at_event(event)
+            if touched_dimension is not None:
+                self._begin_dimension_drag(context, event, touched_dimension)
                 return {'RUNNING_MODAL'}
             self._end_modal_with_persistent_preview(context)
             return self.execute(context)
@@ -971,7 +1160,7 @@ class MESH_OT_holey_tools_resize_hole(
 
         elif (
             self._stage == 'CYLINDER'
-            and self._handle_diameter_step_event(context, event)
+            and self._handle_dimension_step_event(context, event)
         ):
             return {'RUNNING_MODAL'}
 
@@ -1010,20 +1199,32 @@ class MESH_OT_holey_tools_resize_hole(
         self._hover_face_index = -1
         self._fit = None
         self._end_planes = None
+        self._depth_fit = None
         self.scale = 1.0
         self.diameter = 0.0
+        self.depth = 0.0
         self.fit_valid = False
+        self.depth_valid = False
+        self.fit_is_stud = False
+        self.fit_depth_initial = 0.0
+        self.fit_depth_outer = 0.0
+        self.fit_depth_inner = 0.0
+        self.fit_depth_outer_plane = 0
         self.fit_face_indices = ""
         self.fit_end_planes = ""
         self._stage = 'SELECT'
         self._numeric_input = ""
         self._numeric_reference = ""
         self._numeric_replace = True
+        self._diameter_text = ""
+        self._depth_text = ""
+        self._active_dimension = 'DIAMETER'
         self._angle_numeric_input = f"{math.degrees(self.flood_angle):.1f}"
         self._angle_numeric_replace = True
         self._drag_active = False
         self._drag_moved = False
         self._gizmo_rect = None
+        self._gizmo_rects = {}
         self._mouse_entered_view = False
         self._flood_angle_hud_state = {"until": 0.0, "timer_running": False}
         _modal_active = True

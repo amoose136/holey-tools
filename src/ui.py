@@ -42,7 +42,6 @@ class VIEW3D_PT_holey_tools(bpy.types.Panel):
         )
         layout.label(text="Click wall: apply and adjust")
 
-
 def register_properties():
     bpy.types.Scene.holey_tools_flood_angle = bpy.props.FloatProperty(
         name="Flood Angle",

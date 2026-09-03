@@ -88,36 +88,99 @@ assert (
 
 diameter_context = SimpleNamespace(
     scene=SimpleNamespace(
-        unit_settings=SimpleNamespace(system='METRIC', scale_length=1.0)
+        unit_settings=SimpleNamespace(system='METRIC', scale_length=1.0),
+        tool_settings=SimpleNamespace(use_snap=False),
     )
 )
 diameter_operator = SimpleNamespace(
     diameter=0.010,
+    depth=0.020,
+    depth_valid=True,
+    _active_dimension='DIAMETER',
+    _numeric_input="formatted",
     _format_diameter=lambda _context: "formatted",
+    _format_depth=lambda _context: "formatted",
+    _format_dimension=lambda _context, _value: "formatted",
     _build_cylinder_preview=lambda _context: None,
     _apply_diameter_to_mesh=lambda _context: None,
     _set_status_text=lambda _context: None,
+    _tag_redraw=lambda _context: None,
 )
 diameter_operator._scene_unit_info = lambda context: (
     MESH_OT_holey_tools_resize_hole._scene_unit_info(context)
 )
-diameter_operator._step_diameter = lambda context, direction, fine: (
-    MESH_OT_holey_tools_resize_hole._step_diameter(
+diameter_operator._parse_dimension = lambda context, text: (
+    MESH_OT_holey_tools_resize_hole._parse_dimension(
+        diameter_operator, context, text
+    )
+)
+diameter_operator._active_dimension_value = lambda: (
+    MESH_OT_holey_tools_resize_hole._active_dimension_value(diameter_operator)
+)
+diameter_operator._set_active_dimension_value = lambda value: (
+    MESH_OT_holey_tools_resize_hole._set_active_dimension_value(
+        diameter_operator, value
+    )
+)
+diameter_operator._sync_dimension_text = lambda context: (
+    MESH_OT_holey_tools_resize_hole._sync_dimension_text(
+        diameter_operator, context
+    )
+)
+diameter_operator._step_dimension = lambda context, direction, fine: (
+    MESH_OT_holey_tools_resize_hole._step_dimension(
         diameter_operator, context, direction, fine
     )
 )
-assert MESH_OT_holey_tools_resize_hole._handle_diameter_step_event(
+diameter_operator._activate_dimension = lambda context, dimension: (
+    MESH_OT_holey_tools_resize_hole._activate_dimension(
+        diameter_operator, context, dimension
+    )
+)
+assert MESH_OT_holey_tools_resize_hole._handle_dimension_step_event(
     diameter_operator,
     diameter_context,
     SimpleNamespace(type='EQUAL', value='PRESS', shift=False),
 )
 assert abs(diameter_operator.diameter - 0.011) < 1.0e-9
-assert MESH_OT_holey_tools_resize_hole._handle_diameter_step_event(
+assert MESH_OT_holey_tools_resize_hole._handle_dimension_step_event(
     diameter_operator,
     diameter_context,
     SimpleNamespace(type='MINUS', value='PRESS', shift=True),
 )
 assert abs(diameter_operator.diameter - 0.0109) < 1.0e-9
+MESH_OT_holey_tools_resize_hole._begin_dimension_drag(
+    diameter_operator,
+    diameter_context,
+    SimpleNamespace(mouse_x=10, mouse_y=20),
+    'DEPTH',
+)
+assert diameter_operator._active_dimension == 'DEPTH'
+MESH_OT_holey_tools_resize_hole._update_dimension_drag(
+    diameter_operator,
+    diameter_context,
+    SimpleNamespace(mouse_x=1000, mouse_y=20, shift=False, ctrl=False),
+)
+assert abs(diameter_operator.depth - 0.020) < 1.0e-9
+MESH_OT_holey_tools_resize_hole._update_dimension_drag(
+    diameter_operator,
+    diameter_context,
+    SimpleNamespace(mouse_x=1000, mouse_y=220, shift=False, ctrl=False),
+)
+dragged_depth = diameter_operator.depth
+assert dragged_depth > 0.020
+assert MESH_OT_holey_tools_resize_hole._handle_dimension_step_event(
+    diameter_operator,
+    diameter_context,
+    SimpleNamespace(type='EQUAL', value='PRESS', shift=False),
+)
+assert abs(diameter_operator.depth - (dragged_depth + 0.001)) < 1.0e-9
+diameter_operator._numeric_reference = "41 mm"
+diameter_operator._numeric_input = "30 mm"
+MESH_OT_holey_tools_resize_hole._update_numeric_preview(
+    diameter_operator, diameter_context
+)
+assert abs(diameter_operator.depth - 0.030) < 1.0e-8
 
 # Hit testing must be relative to the saved View3D WINDOW region. Modal
 # operators invoked from the sidebar receive misleading mouse_region values.
@@ -134,6 +197,18 @@ gizmo_event = SimpleNamespace(
 assert MESH_OT_holey_tools_resize_hole._event_over_drag_gizmo(
     gizmo_owner, gizmo_event
 )
+
+depth_gizmo_owner = SimpleNamespace(
+    _gizmo_rects={
+        'DIAMETER': (10.0, 20.0, 30.0, 40.0),
+        'DEPTH': (40.0, 10.0, 60.0, 50.0),
+    },
+    _region=SimpleNamespace(x=100, y=200),
+)
+assert MESH_OT_holey_tools_resize_hole._dimension_gizmo_at_event(
+    depth_gizmo_owner,
+    SimpleNamespace(mouse_x=150, mouse_y=230),
+) == 'DEPTH'
 
 
 hull_lines = _convex_hull_lines(
@@ -201,6 +276,11 @@ operator._end_planes = MESH_OT_holey_tools_resize_hole._fit_boundary_planes(
     operator, list(flood), operator._fit["axis"]
 )
 assert len(operator._end_planes) == 2, operator._end_planes
+nonparallel_depth = MESH_OT_holey_tools_resize_hole._fit_adjustable_depth(
+    operator, operator._end_planes, operator._fit
+)
+assert nonparallel_depth is not None
+assert not nonparallel_depth["parallel"]
 
 operator.scale = 1.0
 operator.diameter = 6.0

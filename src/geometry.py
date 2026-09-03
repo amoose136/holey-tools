@@ -12,6 +12,12 @@ import numpy as np
 from mathutils import Vector
 from mathutils.kdtree import KDTree
 
+from .constants import (
+    PARALLEL_PLANE_ANGLE_EPSILON,
+    PLANE_FIT_ABSOLUTE_EPSILON,
+    PLANE_FIT_RELATIVE_EPSILON,
+)
+
 
 class GeometryMixin:
     """Provide selection, fitting, and deformation algorithms to the operator.
@@ -240,23 +246,46 @@ class GeometryMixin:
 
         center = mean + basis_x * center_x + basis_y * center_y
         radial_distances = np.hypot(x - center_x, y - center_y)
+        radius_estimates = {
+            'MINIMUM': float(radial_distances.min()),
+            'AVERAGE': float(radial_distances.mean()),
+            'MAXIMUM': float(radial_distances.max()),
+        }
         estimator = getattr(self, "diameter_estimator", 'AVERAGE')
         if estimator == 'MINIMUM':
-            radius = float(radial_distances.min())
+            radius = radius_estimates['MINIMUM']
         elif estimator == 'MAXIMUM':
-            radius = float(radial_distances.max())
+            radius = radius_estimates['MAXIMUM']
         else:
-            radius = float(radial_distances.mean())
+            radius = radius_estimates['AVERAGE']
         if radius <= 1.0e-12:
             raise ValueError("The fitted cylinder radius is zero")
+
+        # Mesh normals point radially away from a stud and toward the axis of a
+        # hole. Keep this distinction for choosing which end is attached to the
+        # surrounding model when depth changes.
+        wall_orientation = 0.0
+        for face in faces:
+            face_center = matrix_world @ face.calc_center_median()
+            face_offset = face_center - center
+            face_axial = axis * face_offset.dot(axis)
+            face_radial = face_offset - face_axial
+            if face_radial.length_squared <= 1.0e-16:
+                continue
+            wall_orientation += (
+                self._world_normal(face).dot(face_radial.normalized())
+                * max(face.calc_area(), 1.0e-12)
+            )
         return {
             "axis": axis,
             "basis_x": basis_x,
             "basis_y": basis_y,
             "center": center,
             "radius": radius,
+            "radius_estimates": radius_estimates,
             "z_min": float(z.min()),
             "z_max": float(z.max()),
+            "is_stud": wall_orientation >= 0.0,
         }
 
     def _fit_boundary_planes(self, faces, cylinder_axis):
@@ -268,7 +297,9 @@ class GeometryMixin:
         lines parallel to ``cylinder_axis``, as with a longitudinal open edge.
 
         Each result records the component's vertex indices, a point on its
-        plane, and its normal for preserving skewed hole ends during resizing.
+        plane, its normal, and scale-aware planarity diagnostics. The diagnostics
+        let depth adjustment reject non-planar ends without losing the best-fit
+        planes used to preserve skewed cuts during diameter changes.
         """
         selected = set(faces)
         boundary_edges = {
@@ -294,11 +325,11 @@ class GeometryMixin:
                             component_edges.add(neighbor)
                             component_verts.update(neighbor.verts)
                             stack.append(neighbor)
-            components.append(component_verts)
+            components.append((component_verts, component_edges))
 
         matrix_world = self._object.matrix_world
         planes = []
-        for verts in components:
+        for verts, edges in components:
             if len(verts) < 3:
                 continue
             points = np.asarray(
@@ -309,19 +340,160 @@ class GeometryMixin:
                 points - center, full_matrices=False
             )
             normal = Vector(vh[-1]).normalized()
+            centered = points - center
+            extent = float(np.linalg.norm(centered, axis=1).max(initial=0.0))
+            max_error = float(
+                np.abs(centered @ np.asarray(normal)).max(initial=0.0)
+            )
+            tolerance = max(
+                getattr(
+                    self,
+                    "plane_fit_absolute_epsilon",
+                    PLANE_FIT_ABSOLUTE_EPSILON,
+                ),
+                extent
+                * getattr(
+                    self,
+                    "plane_fit_relative_epsilon",
+                    PLANE_FIT_RELATIVE_EPSILON,
+                ),
+            )
 
             # A valid cylinder end surface must intersect lines parallel to the
             # fitted axis. Skip longitudinal/open-patch boundaries.
             if abs(normal.dot(cylinder_axis)) < 1.0e-5:
                 continue
+            adjacent_faces = {
+                face
+                for edge in edges
+                for face in edge.link_faces
+                if face not in selected and not face.hide
+            }
+            adjacent_normal = None
+            if adjacent_faces:
+                weighted_adjacent_normal = Vector((0.0, 0.0, 0.0))
+                for face in adjacent_faces:
+                    weighted_adjacent_normal += self._world_normal(face) * max(
+                        face.calc_area(), 1.0e-12
+                    )
+                if weighted_adjacent_normal.length_squared > 1.0e-16:
+                    adjacent_normal = weighted_adjacent_normal.normalized()
             planes.append(
                 {
                     "verts": sorted(vert.index for vert in verts),
                     "point": Vector(center),
                     "normal": normal,
+                    "max_error": max_error,
+                    "tolerance": tolerance,
+                    "adjacent_normal": adjacent_normal,
                 }
             )
-        return planes
+        return sorted(planes, key=lambda plane: plane["verts"][0])
+
+    def _fit_adjustable_depth(self, planes, fit):
+        """Return fixed-side axial depth metadata for two planar end loops.
+
+        Depth is measured between each loop plane's intersection with the fitted
+        axis, so non-parallel ends remain adjustable. The outer/model-side loop is
+        selected from its adjacent face normal: for a hole that normal points away
+        from the cylindrical region, while a stud reverses the test. Missing or
+        ambiguous adjacent faces fall back to stable boundary-index ordering. Two
+        outward-facing hole ends identify a through-hole, which has no adjustable
+        depth.
+        """
+        if len(planes) != 2:
+            return None
+        if any(
+            plane.get("max_error", math.inf) > plane.get("tolerance", 0.0)
+            for plane in planes
+        ):
+            return None
+
+        axis = fit["axis"]
+        center = fit["center"]
+        coordinates = []
+        for plane in planes:
+            denominator = plane["normal"].dot(axis)
+            if abs(denominator) < 1.0e-5:
+                return None
+            coordinates.append(
+                plane["normal"].dot(plane["point"] - center) / denominator
+            )
+
+        initial = abs(coordinates[1] - coordinates[0])
+        if initial <= 1.0e-12:
+            return None
+
+        is_stud = bool(fit.get("is_stud", False))
+        into_scores = []
+        outer_scores = []
+        for index, plane in enumerate(planes):
+            adjacent_normal = plane.get("adjacent_normal")
+            if adjacent_normal is None:
+                into_scores.append(None)
+                outer_scores.append(None)
+                continue
+            other_coordinate = coordinates[1 - index]
+            into_region = axis * math.copysign(
+                1.0, other_coordinate - coordinates[index]
+            )
+            into_score = adjacent_normal.dot(into_region)
+            into_scores.append(into_score)
+            outer_scores.append(into_score if is_stud else -into_score)
+
+        # Both end faces of a manifold through-hole point away from the selected
+        # cylindrical wall. A blind hole instead has one inner face whose normal
+        # points back into that region. Studs reverse the outer-loop test and are
+        # intentionally excluded from through-hole detection.
+        if not is_stud and all(
+            score is not None and score <= 1.0e-5 for score in into_scores
+        ):
+            return None
+
+        scored_indices = [
+            index for index, score in enumerate(outer_scores) if score is not None
+        ]
+        if len(scored_indices) == 2:
+            outer_index = max(
+                scored_indices, key=lambda index: outer_scores[index]
+            )
+        elif len(scored_indices) == 1:
+            scored_index = scored_indices[0]
+            outer_index = (
+                scored_index
+                if outer_scores[scored_index] > 0.0
+                else 1 - scored_index
+            )
+        else:
+            outer_index = 0
+        inner_index = 1 - outer_index
+        parallel_threshold = math.cos(
+            getattr(
+                self,
+                "parallel_plane_angle_epsilon",
+                PARALLEL_PLANE_ANGLE_EPSILON,
+            )
+        )
+        return {
+            "initial": initial,
+            "outer_coordinate": coordinates[outer_index],
+            "inner_coordinate": coordinates[inner_index],
+            "outer_plane_index": outer_index,
+            "inner_plane_index": inner_index,
+            "is_stud": is_stud,
+            "parallel": abs(
+                planes[0]["normal"].normalized().dot(
+                    planes[1]["normal"].normalized()
+                )
+            ) >= parallel_threshold,
+        }
+
+    def _target_depth_scale(self):
+        """Return the axial scale requested by the optional depth property."""
+        depth_fit = getattr(self, "_depth_fit", None)
+        if not depth_fit or depth_fit["initial"] <= 1.0e-12:
+            return 1.0
+        return max(float(self.depth), 1.0e-9) / depth_fit["initial"]
 
     def _target_scale(self):
         """Convert the requested diameter into a radial deformation scale.
@@ -339,12 +511,13 @@ class GeometryMixin:
     def _apply_diameter_to_mesh(self, context):
         """Rebuild affected vertices from the captured source geometry.
 
-        Each world-space offset is split into axial and radial components, and
-        only the radial component is scaled. Selected boundary vertices are
-        subsequently moved parallel to the cylinder axis onto their fitted end
-        plane so an oblique cut keeps its angle. Proportional weights blend each
-        target with its original position before conversion back to object-local
-        coordinates and the edit-mesh update.
+        Each world-space offset is split into axial and radial components. The
+        radial component follows the diameter; when depth adjustment is valid,
+        the axial coordinate is scaled away from the fixed outer/model-side plane.
+        Selected boundary vertices are subsequently moved parallel to the axis
+        onto the corresponding translated plane so matching oblique cuts keep
+        their angle. Proportional weights blend each target with its original
+        position before conversion back to object-local coordinates.
         """
         obj = context.active_object
         bm = bmesh.from_edit_mesh(obj.data)
@@ -361,6 +534,41 @@ class GeometryMixin:
         inverse = obj.matrix_world.inverted_safe()
         fit = self._fit
         target_scale = self._target_scale()
+        depth_fit = getattr(self, "_depth_fit", None)
+        depth_scale = self._target_depth_scale() if depth_fit else 1.0
+
+        # Confirming untouched dimensions must be an exact geometry no-op. In
+        # particular, do not flatten within-epsilon boundary variation onto the
+        # best-fit planes. This path also restores the verbatim source geometry
+        # when edited dimensions are returned to their fitted values.
+        if math.isclose(
+            target_scale, 1.0, rel_tol=1.0e-6, abs_tol=1.0e-9
+        ) and math.isclose(
+            depth_scale, 1.0, rel_tol=1.0e-6, abs_tol=1.0e-9
+        ):
+            for vertex_index, original in self._original_vertex_coords.items():
+                if vertex_index < len(bm.verts):
+                    bm.verts[vertex_index].co = original.copy()
+            bmesh.update_edit_mesh(
+                obj.data, loop_triangles=True, destructive=False
+            )
+            return
+
+        outer_plane = (
+            (self._end_planes or ())[depth_fit["outer_plane_index"]]
+            if depth_fit
+            else None
+        )
+        inner_center = (
+            fit["center"] + fit["axis"] * depth_fit["inner_coordinate"]
+            if depth_fit
+            else None
+        )
+        inner_half_space = (
+            outer_plane["normal"].dot(inner_center - outer_plane["point"])
+            if outer_plane is not None
+            else 0.0
+        )
         plane_by_vertex = {
             vertex_index: plane
             for plane in (self._end_planes or ())
@@ -377,9 +585,28 @@ class GeometryMixin:
             original = self._original_vertex_coords.get(vertex_index, vert.co)
             world = obj.matrix_world @ original
             offset = world - fit["center"]
-            axial = fit["axis"] * offset.dot(fit["axis"])
+            axial_coordinate = offset.dot(fit["axis"])
+            target_axial_coordinate = axial_coordinate
+            if depth_fit:
+                depth_affects_vertex = vertex_index in selected_indices
+                if not depth_affects_vertex and abs(inner_half_space) > 1.0e-12:
+                    vertex_half_space = outer_plane["normal"].dot(
+                        world - outer_plane["point"]
+                    )
+                    depth_affects_vertex = (
+                        vertex_half_space * inner_half_space > 0.0
+                    )
+                if depth_affects_vertex:
+                    target_axial_coordinate = depth_fit["outer_coordinate"] + (
+                        axial_coordinate - depth_fit["outer_coordinate"]
+                    ) * depth_scale
+            axial = fit["axis"] * axial_coordinate
             radial = offset - axial
-            world_target = fit["center"] + axial + radial * target_scale
+            world_target = (
+                fit["center"]
+                + fit["axis"] * target_axial_coordinate
+                + radial * target_scale
+            )
 
             # Radial scaling changes where an oblique end plane intersects the
             # cylinder. Slide boundary vertices parallel to the cylinder axis back
@@ -392,8 +619,19 @@ class GeometryMixin:
             if plane is not None:
                 denominator = plane["normal"].dot(fit["axis"])
                 if abs(denominator) > 1.0e-8:
+                    plane_point = plane["point"]
+                    if depth_fit:
+                        plane_coordinate = plane["normal"].dot(
+                            plane_point - fit["center"]
+                        ) / denominator
+                        target_plane_coordinate = depth_fit["outer_coordinate"] + (
+                            plane_coordinate - depth_fit["outer_coordinate"]
+                        ) * depth_scale
+                        plane_point = plane_point + fit["axis"] * (
+                            target_plane_coordinate - plane_coordinate
+                        )
                     distance = plane["normal"].dot(
-                        plane["point"] - world_target
+                        plane_point - world_target
                     ) / denominator
                     world_target += fit["axis"] * distance
             blended_world = world.lerp(world_target, weight)

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Amos Manneschmidt
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Screen-space GPU previews and the diameter drag gizmo."""
+"""Screen-space GPU previews and dimension drag gizmos."""
 
 import math
 import time
@@ -156,6 +156,14 @@ class GpuPreviewMixin:
         """
         fit = self._fit
         radius = fit["radius"] * self._target_scale()
+        z_min = fit["z_min"]
+        z_max = fit["z_max"]
+        depth_fit = getattr(self, "_depth_fit", None)
+        if depth_fit:
+            depth_scale = self._target_depth_scale()
+            outer = depth_fit["outer_coordinate"]
+            z_min = outer + (z_min - outer) * depth_scale
+            z_max = outer + (z_max - outer) * depth_scale
         segments = max(32, min(128, len(self._locked_indices) * 4))
         bottom = []
         top = []
@@ -166,8 +174,8 @@ class GpuPreviewMixin:
                 fit["basis_x"] * math.cos(angle)
                 + fit["basis_y"] * math.sin(angle)
             ) * radius
-            bottom.append(fit["center"] + fit["axis"] * fit["z_min"] + radial)
-            top.append(fit["center"] + fit["axis"] * fit["z_max"] + radial)
+            bottom.append(fit["center"] + fit["axis"] * z_min + radial)
+            top.append(fit["center"] + fit["axis"] * z_max + radial)
 
         triangles = []
         lines = []
@@ -460,34 +468,57 @@ class GpuPreviewMixin:
             gpu.state.blend_set('NONE')
 
     def _draw_dimension_label(self, region, projected_points, color):
-        """Draw the live diameter text, interaction hint, and optional gizmo.
+        """Draw live dimension text and perpendicular diameter/depth handles.
 
         The block is placed beside the projected cylinder while remaining within
-        the region bounds. During direct numeric editing it also records the drag
-        handle's pixel hit rectangle; after handoff to Blender's Redo panel only
-        the value and updated hint remain.
+        the region bounds. Diameter uses a horizontal handle and optional depth
+        uses a vertical handle below it. During direct editing both pixel hit
+        rectangles are retained; the active value is the target for typing.
         """
-        text = getattr(self, "_numeric_input", "").strip()
-        if not text or not projected_points:
+        diameter_text = getattr(self, "_diameter_text", "").strip()
+        if not diameter_text:
+            diameter_text = getattr(self, "_numeric_input", "").strip()
+        has_depth = bool(getattr(self, "depth_valid", False))
+        depth_text = (
+            getattr(self, "_depth_text", "").strip()
+            if has_depth
+            else ""
+        )
+        if not projected_points:
             if getattr(self, "_accepts_numeric_input", True):
                 self._gizmo_rect = None
+                self._gizmo_rects = {}
             return
 
         font_id = 0
         editing = getattr(self, "_accepts_numeric_input", True)
+        active = getattr(self, "_active_dimension", 'DIAMETER')
         ui_scale = _ui_scale()
-        display_text = f"{DIAMETER_SYMBOL} {text}"
+        diameter_display = f"{DIAMETER_SYMBOL} {diameter_text or '—'}"
+        depth_display = f"Depth {depth_text or '—'}" if has_depth else ""
         hint_text = (
-            "Type to change"
+            f"Type changes {active.title()}"
             if editing
             else "Change in Redo panel"
         )
         blf.size(font_id, 16.0 * ui_scale)
-        width, height = blf.dimensions(font_id, display_text)
+        diameter_width, text_height = blf.dimensions(font_id, diameter_display)
+        depth_width, depth_text_height = (
+            blf.dimensions(font_id, depth_display)
+            if depth_display
+            else (0.0, 0.0)
+        )
         blf.size(font_id, 12.0 * ui_scale)
         hint_width, hint_height = blf.dimensions(font_id, hint_text)
         gizmo_width = 68.0 * ui_scale
-        block_width = max(width, hint_width, gizmo_width if editing else 0.0)
+        depth_gizmo_height = 46.0 * ui_scale
+        depth_row_width = 28.0 * ui_scale + depth_width
+        block_width = max(
+            diameter_width,
+            hint_width,
+            gizmo_width if editing else 0.0,
+            depth_row_width,
+        )
         xs = [point[0] for point in projected_points]
         ys = [point[1] for point in projected_points]
         margin = 8.0 * ui_scale
@@ -496,38 +527,91 @@ class GpuPreviewMixin:
         x = max(xs) + label_gap
         if x + block_width > region.width - margin:
             x = max(margin, min(xs) - block_width - label_gap)
-        total_height = hint_height + text_gap + height
-        minimum_y = (30.0 if editing else 8.0) * ui_scale
+        diameter_handle_height = 24.0 * ui_scale if editing else 0.0
+        depth_row_height = (
+            max(depth_text_height, depth_gizmo_height if editing else 0.0)
+            if depth_display
+            else 0.0
+        )
+        row_gap = 8.0 * ui_scale if depth_display else 0.0
+        total_height = (
+            hint_height
+            + text_gap
+            + text_height
+            + diameter_handle_height
+            + row_gap
+            + depth_row_height
+        )
+        minimum_y = 8.0 * ui_scale
         y = min(
             region.height - total_height - margin,
-            max(minimum_y, (min(ys) + max(ys)) * 0.5),
+            max(minimum_y, (min(ys) + max(ys) - total_height) * 0.5),
         )
 
         blf.enable(font_id, blf.SHADOW)
         blf.shadow(font_id, 5, 0.0, 0.0, 0.0, 0.9)
         shadow_offset = max(1, round(ui_scale))
         blf.shadow_offset(font_id, shadow_offset, -shadow_offset)
+        current_y = y + total_height - hint_height
         blf.size(font_id, 12.0 * ui_scale)
         blf.color(font_id, color[0], color[1], color[2], 0.8)
-        blf.position(font_id, x, y + height + text_gap, 0.0)
+        blf.position(font_id, x, current_y, 0.0)
         blf.draw(font_id, hint_text)
+        current_y -= text_gap + text_height
         blf.size(font_id, 16.0 * ui_scale)
-        blf.color(font_id, color[0], color[1], color[2], 1.0)
-        blf.position(font_id, x, y, 0.0)
-        blf.draw(font_id, display_text)
-        blf.disable(font_id, blf.SHADOW)
+        diameter_alpha = 1.0 if active == 'DIAMETER' or not editing else 0.72
+        blf.color(font_id, color[0], color[1], color[2], diameter_alpha)
+        blf.position(font_id, x, current_y, 0.0)
+        blf.draw(font_id, diameter_display)
 
         if editing:
-            gizmo_y = y - 14.0 * ui_scale
-            self._gizmo_rect = (
+            diameter_gizmo_y = current_y - 14.0 * ui_scale
+            diameter_rect = (
                 x - 7.0 * ui_scale,
-                gizmo_y - 10.0 * ui_scale,
+                diameter_gizmo_y - 10.0 * ui_scale,
                 x + gizmo_width + 7.0 * ui_scale,
-                gizmo_y + 10.0 * ui_scale,
+                diameter_gizmo_y + 10.0 * ui_scale,
             )
+            self._gizmo_rect = diameter_rect
+            self._gizmo_rects = {'DIAMETER': diameter_rect}
             GpuPreviewMixin._draw_drag_gizmo(
-                region, x, gizmo_y, gizmo_width, color, ui_scale
+                region, x, diameter_gizmo_y, gizmo_width, color, ui_scale
             )
+        else:
+            self._gizmo_rects = {}
+
+        if depth_display:
+            depth_row_y = y
+            depth_alpha = 1.0 if active == 'DEPTH' or not editing else 0.72
+            blf.size(font_id, 16.0 * ui_scale)
+            blf.color(font_id, color[0], color[1], color[2], depth_alpha)
+            blf.position(
+                font_id,
+                x + 28.0 * ui_scale,
+                depth_row_y + (depth_row_height - depth_text_height) * 0.5,
+                0.0,
+            )
+            blf.draw(font_id, depth_display)
+            if editing:
+                depth_x = x + 10.0 * ui_scale
+                depth_bottom = depth_row_y
+                depth_top = depth_row_y + depth_gizmo_height
+                depth_rect = (
+                    depth_x - 10.0 * ui_scale,
+                    depth_bottom - 4.0 * ui_scale,
+                    depth_x + 10.0 * ui_scale,
+                    depth_top + 4.0 * ui_scale,
+                )
+                self._gizmo_rects['DEPTH'] = depth_rect
+                GpuPreviewMixin._draw_depth_drag_gizmo(
+                    region,
+                    depth_x,
+                    depth_bottom,
+                    depth_top,
+                    color,
+                    ui_scale,
+                )
+        blf.disable(font_id, blf.SHADOW)
 
     @staticmethod
     def _draw_drag_gizmo(region, x, y, width, color, ui_scale=1.0):
@@ -535,7 +619,7 @@ class GpuPreviewMixin:
 
         Pixel endpoints are converted to normalized-device coordinates and
         rendered under identity matrices, matching the main preview pipeline.
-        This method draws only; event hit testing uses ``self._gizmo_rect``.
+        This method draws only; event hit testing uses ``self._gizmo_rects``.
         """
         left = x
         right = x + width
@@ -577,11 +661,48 @@ class GpuPreviewMixin:
         finally:
             gpu.state.blend_set('NONE')
 
+    @staticmethod
+    def _draw_depth_drag_gizmo(region, x, bottom, top, color, ui_scale=1.0):
+        """Draw the depth handle perpendicular to the diameter handle."""
+        arrow = 6.0 * ui_scale
+        inset = 7.0 * ui_scale
+        pixel_lines = (
+            (x, bottom + inset), (x, top - inset),
+            (x, bottom), (x - arrow, bottom + arrow),
+            (x, bottom), (x + arrow, bottom + arrow),
+            (x, top), (x - arrow, top - arrow),
+            (x, top), (x + arrow, top - arrow),
+        )
+        viewport_width = max(1, region.width)
+        viewport_height = max(1, region.height)
+        coords = [
+            (
+                2.0 * point[0] / viewport_width - 1.0,
+                2.0 * point[1] / viewport_height - 1.0,
+                0.0,
+            )
+            for point in pixel_lines
+        ]
+        shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+        batch = batch_for_shader(shader, 'LINES', {"pos": coords})
+        gpu.state.blend_set('ALPHA')
+        try:
+            with gpu.matrix.push_pop(), gpu.matrix.push_pop_projection():
+                gpu.matrix.load_identity()
+                gpu.matrix.load_projection_matrix(Matrix.Identity(4))
+                shader.uniform_float("viewportSize", _viewport_size(region))
+                shader.uniform_float("lineWidth", _line_width())
+                shader.uniform_float("color", color)
+                batch.draw(shader)
+        finally:
+            gpu.state.blend_set('NONE')
+
     def _event_over_drag_gizmo(self, event):
         """Return whether a View3D event lies inside the active gizmo rectangle."""
-        rect = self._gizmo_rect
-        if rect is None:
-            return False
+        return GpuPreviewMixin._dimension_gizmo_at_event(self, event) is not None
+
+    def _dimension_gizmo_at_event(self, event):
+        """Return the dimension whose handle contains the event, if any."""
         region = getattr(self, "_region", None)
         if region is not None:
             x = event.mouse_x - region.x
@@ -589,7 +710,11 @@ class GpuPreviewMixin:
         else:
             x = event.mouse_region_x
             y = event.mouse_region_y
-        return (
-            rect[0] <= x <= rect[2]
-            and rect[1] <= y <= rect[3]
-        )
+        rects = getattr(self, "_gizmo_rects", None)
+        if not rects:
+            legacy_rect = getattr(self, "_gizmo_rect", None)
+            rects = {'DIAMETER': legacy_rect} if legacy_rect is not None else {}
+        for dimension, rect in rects.items():
+            if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                return dimension
+        return None
