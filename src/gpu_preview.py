@@ -105,7 +105,7 @@ def _convex_hull_lines(points):
 
 
 class GpuPreviewMixin:
-    """Build and draw selection, cylinder, label, and drag-handle overlays.
+    """Build and draw selection, cone/cylinder, label, and handle overlays.
 
     Preview geometry is retained in world space and projected during each draw
     callback so it tracks viewport navigation. Drawing occurs in POST_PIXEL
@@ -147,7 +147,7 @@ class GpuPreviewMixin:
         self._tag_redraw(context)
 
     def _build_cylinder_preview(self, context):
-        """Build a world-space cylinder for the current fitted diameter.
+        """Build a world-space cylinder or cone for the current dimensions.
 
         The wall is stored as filled triangles. Only the two cap circumferences
         are stored as fixed lines; the camera-dependent wall silhouette is added
@@ -155,7 +155,6 @@ class GpuPreviewMixin:
         region but remains bounded to control preview cost.
         """
         fit = self._fit
-        radius = fit["radius"] * self._target_scale()
         z_min = fit["z_min"]
         z_max = fit["z_max"]
         depth_fit = getattr(self, "_depth_fit", None)
@@ -164,18 +163,29 @@ class GpuPreviewMixin:
             outer = depth_fit["outer_coordinate"]
             z_min = outer + (z_min - outer) * depth_scale
             z_max = outer + (z_max - outer) * depth_scale
+        target_radius_at = getattr(self, "_target_radius_at", None)
+        if target_radius_at is None:
+            radius = fit["radius"] * self._target_scale()
+            bottom_radius = top_radius = radius
+        else:
+            bottom_radius = target_radius_at(z_min)
+            top_radius = target_radius_at(z_max)
         segments = max(32, min(128, len(self._locked_indices) * 4))
         bottom = []
         top = []
 
         for index in range(segments):
             angle = math.tau * index / segments
-            radial = (
+            radial_direction = (
                 fit["basis_x"] * math.cos(angle)
                 + fit["basis_y"] * math.sin(angle)
-            ) * radius
-            bottom.append(fit["center"] + fit["axis"] * z_min + radial)
-            top.append(fit["center"] + fit["axis"] * z_max + radial)
+            )
+            bottom.append(
+                fit["center"] + fit["axis"] * z_min + radial_direction * bottom_radius
+            )
+            top.append(
+                fit["center"] + fit["axis"] * z_max + radial_direction * top_radius
+            )
 
         triangles = []
         lines = []
@@ -468,7 +478,7 @@ class GpuPreviewMixin:
             gpu.state.blend_set('NONE')
 
     def _draw_dimension_label(self, region, projected_points, color):
-        """Draw live dimension text and perpendicular diameter/depth handles.
+        """Draw live dimension text and diameter/depth/angle handles.
 
         The block is placed beside the projected cylinder while remaining within
         the region bounds. Diameter uses a horizontal handle and optional depth
@@ -479,9 +489,15 @@ class GpuPreviewMixin:
         if not diameter_text:
             diameter_text = getattr(self, "_numeric_input", "").strip()
         has_depth = bool(getattr(self, "depth_valid", False))
+        has_angle = bool(getattr(self, "angle_valid", False))
         depth_text = (
             getattr(self, "_depth_text", "").strip()
             if has_depth
+            else ""
+        )
+        angle_text = (
+            getattr(self, "_conic_angle_text", "").strip()
+            if has_angle
             else ""
         )
         if not projected_points:
@@ -496,6 +512,7 @@ class GpuPreviewMixin:
         ui_scale = _ui_scale()
         diameter_display = f"{DIAMETER_SYMBOL} {diameter_text or '—'}"
         depth_display = f"Depth {depth_text or '—'}" if has_depth else ""
+        angle_display = f"Angle {angle_text or '—'}" if has_angle else ""
         hint_text = (
             f"Type changes {active.title()}"
             if editing
@@ -508,16 +525,23 @@ class GpuPreviewMixin:
             if depth_display
             else (0.0, 0.0)
         )
+        angle_width, angle_text_height = (
+            blf.dimensions(font_id, angle_display)
+            if angle_display
+            else (0.0, 0.0)
+        )
         blf.size(font_id, 12.0 * ui_scale)
         hint_width, hint_height = blf.dimensions(font_id, hint_text)
         gizmo_width = 68.0 * ui_scale
         depth_gizmo_height = 46.0 * ui_scale
         depth_row_width = 28.0 * ui_scale + depth_width
+        angle_row_width = max(angle_width, gizmo_width if editing else 0.0)
         block_width = max(
             diameter_width,
             hint_width,
             gizmo_width if editing else 0.0,
             depth_row_width,
+            angle_row_width,
         )
         xs = [point[0] for point in projected_points]
         ys = [point[1] for point in projected_points]
@@ -533,7 +557,12 @@ class GpuPreviewMixin:
             if depth_display
             else 0.0
         )
-        row_gap = 8.0 * ui_scale if depth_display else 0.0
+        angle_handle_height = 24.0 * ui_scale if editing and angle_display else 0.0
+        angle_row_height = (
+            angle_text_height + angle_handle_height if angle_display else 0.0
+        )
+        row_count = int(bool(depth_display)) + int(bool(angle_display))
+        row_gap = 8.0 * ui_scale * row_count
         total_height = (
             hint_height
             + text_gap
@@ -541,6 +570,7 @@ class GpuPreviewMixin:
             + diameter_handle_height
             + row_gap
             + depth_row_height
+            + angle_row_height
         )
         minimum_y = 8.0 * ui_scale
         y = min(
@@ -581,7 +611,7 @@ class GpuPreviewMixin:
             self._gizmo_rects = {}
 
         if depth_display:
-            depth_row_y = y
+            depth_row_y = y + angle_row_height + (8.0 * ui_scale if angle_display else 0.0)
             depth_alpha = 1.0 if active == 'DEPTH' or not editing else 0.72
             blf.size(font_id, 16.0 * ui_scale)
             blf.color(font_id, color[0], color[1], color[2], depth_alpha)
@@ -610,6 +640,25 @@ class GpuPreviewMixin:
                     depth_top,
                     color,
                     ui_scale,
+                )
+        if angle_display:
+            angle_row_y = y
+            angle_alpha = 1.0 if active == 'ANGLE' or not editing else 0.72
+            blf.size(font_id, 16.0 * ui_scale)
+            blf.color(font_id, color[0], color[1], color[2], angle_alpha)
+            blf.position(font_id, x, angle_row_y + angle_handle_height, 0.0)
+            blf.draw(font_id, angle_display)
+            if editing:
+                angle_gizmo_y = angle_row_y + 8.0 * ui_scale
+                angle_rect = (
+                    x - 7.0 * ui_scale,
+                    angle_gizmo_y - 10.0 * ui_scale,
+                    x + gizmo_width + 7.0 * ui_scale,
+                    angle_gizmo_y + 10.0 * ui_scale,
+                )
+                self._gizmo_rects['ANGLE'] = angle_rect
+                GpuPreviewMixin._draw_drag_gizmo(
+                    region, x, angle_gizmo_y, gizmo_width, color, ui_scale
                 )
         blf.disable(font_id, blf.SHADOW)
 

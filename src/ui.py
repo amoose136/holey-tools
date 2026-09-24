@@ -56,7 +56,7 @@ class VIEW3D_PT_holey_tools(bpy.types.Panel):
         extract = layout.operator("mesh.holey_tools_extract_axis")
         extract.attribute_name = context.scene.holey_tools_axis_attribute
         extract.flood_angle = context.scene.holey_tools_flood_angle
-        layout.label(text="Click region: extract principal axis")
+        layout.label(text="Click region: fit cone axis")
 
 
 def register_properties():

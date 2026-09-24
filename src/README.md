@@ -6,7 +6,7 @@ Holey Tools provides precision mesh-editing tools for holes. Version 0.9 contain
 ## Requirements
 
 - Blender 5.2 or newer
-- A mesh object in Edit Mode that has some cylindrical indentation or through hole.
+- A mesh object in Edit Mode with a cylindrical or conical hole/stud wall.
 
 ## Resize Hole
 
@@ -17,11 +17,11 @@ Holey Tools provides precision mesh-editing tools for holes. Version 0.9 contain
     - **Average** uses the mean selected radius.
     - **Maximum** uses the widest selected radius.
 
-3. Click **Resize Hole** and hover a cylindrical wall.
+3. Click **Resize Hole** and hover a cylindrical or conical wall.
 
 4. Adjust the flood-fill angle with `[` and `]`, then click the wall.
 
-5. Type a diameter or drag the horizontal on-screen handle. When planar end loops are available, use the vertical handle below it to adjust depth. Typing and +/- edit the most recently touched handle, defaulting to diameter. Hold Shift for fine adjustment.
+5. Type a diameter or drag the horizontal on-screen handle. When two planar end arcs are recoverable, use the vertical handle to adjust depth: drag down for deeper or up for shallower. Detected cones also expose a horizontal **Angle** handle for their half-angle. Typing and +/- edit the most recently touched handle, defaulting to diameter. Hold Shift for fine adjustment.
 
     Ctrl temporarily inverts Blender's snapping toggle; snapped changes use 0.1 mm increments.
 
@@ -29,17 +29,15 @@ Holey Tools provides precision mesh-editing tools for holes. Version 0.9 contain
 
 6. Click away from the handle or press Enter to finish. Press Esc to cancel.
 
-The tool respects Blender's proportional-editing toggle, radius, falloff, connected mode, projected mode, and global snapping toggle. The final diameter remains editable from Blender's Adjust Last Operation panel, where the minimum, average, or maximum diameter estimate can also be changed. A **Depth** field appears there when the selected wall has exactly two planar boundary loops. Parallelism is not required: depth is measured between the loop centers on the fitted cylinder axis. The end attached to the surrounding model stays fixed while the other end moves.
+The tool respects Blender's proportional-editing toggle, radius, falloff, connected mode, projected mode, and global snapping toggle. The final diameter remains editable from Blender's Adjust Last Operation panel, where the minimum, average, or maximum diameter estimate can also be changed. **Depth** appears when two planar end arcs can be recovered, even when missing wall faces break the arcs into fragments. It is the axis distance from the top/model-side circle center to the bottom circle center. The top circle stays fixed while the other end moves. A detected cone also exposes **Conic Angle**, expressed as the half-angle between its wall and axis; changing it pivots the taper about that top circle.
 
 ## Current limitations
 
 - Resize Hole operates on one connected hole wall at a time.
-- The selected wall must contain enough geometry to define a stable cylinder.
+- The selected wall must contain enough geometry to define a stable circular-cone axis and radial regression.
 - Minimum and maximum estimates are sensitive to genuinely irregular wall vertices.
-- Depth adjustment is unavailable for non-planar ends and wall selections that do not produce exactly two boundary loops.
-- Through-holes expose diameter adjustment only; depth is reserved for blind holes and studs with a fixed model-side boundary.
-- Conics are not supported.
-- Countersunk holes do not preserves angles on adjustment (yet).
+- Depth adjustment is unavailable for non-planar ends or walls from which two distinct end arcs cannot be recovered.
+- Cylindrical through-holes expose diameter only; conical through-holes retain top-to-bottom depth and angle controls.
 - Counterbore holes are not (yet) supported.
 - Holes capped by non-planar ends will not be handled well yet. For that, an upcoming non-destructive reconstruction mode is planned that will rebuild the surface without the hole and then build the hole with a boolean and a node tree.
 
@@ -52,32 +50,33 @@ The tool respects Blender's proportional-editing toggle, radius, falloff, connec
 4. Click the region or press Enter to store it.
 
 The tool replaces a face-domain integer attribute (by default
-`holey_axis_region`) with the flooded selection and creates the reusable
-**Holey Tools Extract Axis** geometry node group. The wrapper appends and uses
-Blender's bundled **Geometry Principal Components** asset. Add the wrapper inside
-another Geometry Nodes tree and connect geometry containing the attribute. Its
-outputs are:
+`holey_axis_region`) with the flooded selection and adds an **Extract Axis**
+Geometry Nodes modifier. Its reusable **Holey Tools Extract Axis** group uses the
+bundled **Fit Circular Cone** asset, so the fit remains useful for conical surfaces,
+missing faces, and irregular topology. Its outputs are:
 
-- **Geometry**: input geometry joined with the center indicator.
-- **Indicator**: a separate low-poly icosphere placed at the analyzed center.
-- **Axis**: the outlying longest or shortest principal axis of the selected region.
-  Its sign is arbitrary, so either direction represents the same axis.
-- **Center**, **Rotation**, and **Principal Components**: values returned by the
-  bundled principal-components group.
-- **Valid**: true when the named attribute exists and selects at least one face.
+- **Geometry**: input geometry joined with the aligned axis indicator.
+- **Indicator**: the aligned indicator geometry by itself.
+- **Axis** and **Center**: a normalized direction and point describing the fitted
+  axis. Its sign is arbitrary, so either direction represents the same line.
+- **Radius**, **Slope**, and **Half Angle**: the fitted circular-cone parameters.
+- **Valid**: true when the named attribute produces a usable fit.
 
 The **Face Group** string input defaults to the most recently extracted attribute
-name and can be changed per group-node instance. **Indicator Size** controls the
-icosphere radius. The tool does not add a modifier automatically.
+name and can be changed per modifier. **Indicator Size** uniformly scales the
+marker. Leave **Indicator Object** blank to use the generated mesh arrow, or choose
+a mesh object to place its origin at `Center` and align its local +Z direction with
+`Axis`.
 
 ## Source layout
 
 - `constants.py` contains version metadata, fallback colors, and shared UI options.
-- `geometry.py` contains cylinder fitting, flood fill, proportional weights, and mesh deformation.
-- `gpu_preview.py` contains screen-space tinting, cylinder drawing, labels, and the drag gizmos.
+- `geometry.py` contains circular-cone fitting, gap-aware flood fill, proportional weights, and mesh deformation.
+- `gpu_preview.py` contains screen-space tinting, cone/cylinder drawing, labels, and drag gizmos.
 - `operator.py` contains modal interaction, numeric input, redo state, and runtime cleanup.
 - `extract_axis.py` contains the face-group extraction modal operator.
-- `axis_nodes.py` wraps Blender's bundled Geometry Principal Components asset.
+- `axis_nodes.py` loads the bundled fitting assets and builds the Extract Axis modifier.
+- `assets/holeyToolsAssets.blend` contains reusable Geometry Nodes math and fitting assets.
 - `ui.py` contains the sidebar panel and registered scene setting.
 - `__init__.py` is Blender's extension entry point and registers the operator and UI.
 

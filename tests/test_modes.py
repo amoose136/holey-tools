@@ -332,4 +332,95 @@ for vert in anchored_bmesh.verts[16:32]:
 for vert in anchored_bmesh.verts[32:]:
     assert abs(vert.co.z - 4.0) < 1.0e-6, vert.co
 
+
+# Mirror the Geometry Nodes circular-cone fit on an incomplete frustum. Side
+# defect edges from omitted faces must not be mistaken for end boundaries.
+bpy.ops.object.mode_set(mode='OBJECT')
+anchored_object.select_set(False)
+cone_object, cone_bmesh = create_ring_mesh(
+    "incomplete_cone_test",
+    ((2.0, -2.0), (1.0, 2.0)),
+    segments=32,
+)
+missing_faces = [
+    cone_bmesh.faces[index] for index in (1, 7, 13, 22)
+]
+bmesh.ops.delete(cone_bmesh, geom=missing_faces, context='FACES_ONLY')
+cone_bmesh.faces.index_update()
+cone_bmesh.faces.ensure_lookup_table()
+cone_faces = list(cone_bmesh.faces)
+cone_operator = SimpleNamespace(
+    _object=cone_object,
+    _locked_indices={face.index for face in cone_faces},
+    diameter_estimator='AVERAGE',
+    scale=1.0,
+)
+cone_operator._world_normal = lambda face: (
+    MESH_OT_holey_tools_resize_hole._world_normal(cone_operator, face)
+)
+cone_operator.flood_angle = math.radians(60.0)
+cone_flood = MESH_OT_holey_tools_resize_hole._flood_fill(
+    cone_operator, cone_faces[0]
+)
+assert len(cone_flood) == len(cone_faces), (len(cone_flood), len(cone_faces))
+cone_faces = list(cone_flood)
+cone_operator._fit = MESH_OT_holey_tools_resize_hole._fit_cylinder(
+    cone_operator, cone_faces
+)
+assert cone_operator._fit["is_cone"], cone_operator._fit
+assert abs(abs(cone_operator._fit["slope"]) - 0.25) < 1.0e-5
+assert abs(
+    cone_operator._fit["half_angle"] - math.atan(0.25)
+) < 1.0e-5
+cone_operator._end_planes = MESH_OT_holey_tools_resize_hole._fit_boundary_planes(
+    cone_operator,
+    cone_faces,
+    cone_operator._fit["axis"],
+    cone_operator._fit,
+)
+assert len(cone_operator._end_planes) == 2, cone_operator._end_planes
+cone_operator._depth_fit = MESH_OT_holey_tools_resize_hole._fit_adjustable_depth(
+    cone_operator, cone_operator._end_planes, cone_operator._fit
+)
+assert cone_operator._depth_fit is not None
+assert abs(cone_operator._depth_fit["initial"] - 4.0) < 1.0e-5
+outer_coordinate = cone_operator._depth_fit["outer_coordinate"]
+assert abs(
+    cone_operator._fit["radius"]
+    + cone_operator._fit["slope"] * outer_coordinate
+    - 2.0
+) < 1.0e-5
+
+cone_operator._fit["radius_coordinate"] = outer_coordinate
+cone_operator.diameter = 4.0
+cone_operator.depth = 4.0
+cone_operator.conic_angle = cone_operator._fit["half_angle"]
+cone_operator.angle_valid = True
+cone_operator._target_scale = lambda: (
+    MESH_OT_holey_tools_resize_hole._target_scale(cone_operator)
+)
+cone_operator._target_depth_scale = lambda: (
+    MESH_OT_holey_tools_resize_hole._target_depth_scale(cone_operator)
+)
+tool_settings.use_proportional_edit = False
+cone_vertices = {vert for face in cone_faces for vert in face.verts}
+MESH_OT_holey_tools_resize_hole._capture_deformation_state(
+    cone_operator, bpy.context, cone_bmesh, cone_vertices
+)
+
+# Increasing depth alone follows the original cone generators. Changing the
+# half-angle afterward pivots the taper about the wider top/model-side circle.
+cone_operator.depth = 5.0
+cone_operator.conic_angle = math.atan(0.1)
+MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
+    cone_operator, bpy.context
+)
+cone_bmesh = bmesh.from_edit_mesh(cone_object.data)
+outer_points = [vert.co for vert in cone_bmesh.verts[:32]]
+inner_points = [vert.co for vert in cone_bmesh.verts[32:]]
+assert max(abs(point.z + 2.0) for point in outer_points) < 1.0e-5
+assert max(abs(math.hypot(point.x, point.y) - 2.0) for point in outer_points) < 1.0e-5
+assert max(abs(point.z - 3.0) for point in inner_points) < 1.0e-5
+assert max(abs(math.hypot(point.x, point.y) - 1.5) for point in inner_points) < 1.0e-5
+
 print("HOLEY_TOOLS_MODE_TESTS_OK")

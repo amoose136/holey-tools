@@ -96,10 +96,13 @@ diameter_operator = SimpleNamespace(
     diameter=0.010,
     depth=0.020,
     depth_valid=True,
+    conic_angle=math.radians(10.0),
+    angle_valid=False,
     _active_dimension='DIAMETER',
     _numeric_input="formatted",
     _format_diameter=lambda _context: "formatted",
     _format_depth=lambda _context: "formatted",
+    _format_conic_angle=lambda: "10°",
     _format_dimension=lambda _context, _value: "formatted",
     _build_cylinder_preview=lambda _context: None,
     _apply_diameter_to_mesh=lambda _context: None,
@@ -167,6 +170,12 @@ MESH_OT_holey_tools_resize_hole._update_dimension_drag(
     diameter_context,
     SimpleNamespace(mouse_x=1000, mouse_y=220, shift=False, ctrl=False),
 )
+assert diameter_operator.depth < 0.020
+MESH_OT_holey_tools_resize_hole._update_dimension_drag(
+    diameter_operator,
+    diameter_context,
+    SimpleNamespace(mouse_x=1000, mouse_y=-180, shift=False, ctrl=False),
+)
 dragged_depth = diameter_operator.depth
 assert dragged_depth > 0.020
 assert MESH_OT_holey_tools_resize_hole._handle_dimension_step_event(
@@ -181,6 +190,36 @@ MESH_OT_holey_tools_resize_hole._update_numeric_preview(
     diameter_operator, diameter_context
 )
 assert abs(diameter_operator.depth - 0.030) < 1.0e-8
+
+# Cone half-angle is a third active dimension. It uses degrees for direct input,
+# one-degree steps, and a horizontal drag whose rightward direction increases it.
+diameter_operator.angle_valid = True
+MESH_OT_holey_tools_resize_hole._activate_dimension(
+    diameter_operator, diameter_context, 'ANGLE'
+)
+assert diameter_operator._active_dimension == 'ANGLE'
+MESH_OT_holey_tools_resize_hole._step_dimension(
+    diameter_operator, diameter_context, 1, False
+)
+assert abs(diameter_operator.conic_angle - math.radians(11.0)) < 1.0e-9
+diameter_operator._numeric_input = "20 deg"
+diameter_operator._parse_angle = MESH_OT_holey_tools_resize_hole._parse_angle
+MESH_OT_holey_tools_resize_hole._update_numeric_preview(
+    diameter_operator, diameter_context
+)
+assert abs(diameter_operator.conic_angle - math.radians(20.0)) < 1.0e-9
+MESH_OT_holey_tools_resize_hole._begin_dimension_drag(
+    diameter_operator,
+    diameter_context,
+    SimpleNamespace(mouse_x=10, mouse_y=20),
+    'ANGLE',
+)
+MESH_OT_holey_tools_resize_hole._update_dimension_drag(
+    diameter_operator,
+    diameter_context,
+    SimpleNamespace(mouse_x=50, mouse_y=20, shift=False, ctrl=False),
+)
+assert diameter_operator.conic_angle > math.radians(20.0)
 
 # Hit testing must be relative to the saved View3D WINDOW region. Modal
 # operators invoked from the sidebar receive misleading mouse_region values.
@@ -202,6 +241,7 @@ depth_gizmo_owner = SimpleNamespace(
     _gizmo_rects={
         'DIAMETER': (10.0, 20.0, 30.0, 40.0),
         'DEPTH': (40.0, 10.0, 60.0, 50.0),
+        'ANGLE': (70.0, 10.0, 100.0, 50.0),
     },
     _region=SimpleNamespace(x=100, y=200),
 )
@@ -209,6 +249,10 @@ assert MESH_OT_holey_tools_resize_hole._dimension_gizmo_at_event(
     depth_gizmo_owner,
     SimpleNamespace(mouse_x=150, mouse_y=230),
 ) == 'DEPTH'
+assert MESH_OT_holey_tools_resize_hole._dimension_gizmo_at_event(
+    depth_gizmo_owner,
+    SimpleNamespace(mouse_x=185, mouse_y=230),
+) == 'ANGLE'
 
 
 hull_lines = _convex_hull_lines(

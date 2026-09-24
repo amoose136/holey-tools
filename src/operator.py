@@ -47,7 +47,9 @@ def _update_diameter_estimator(operator, _context):
     if radius <= 1.0e-12:
         return
     operator.fit_radius = radius
-    operator.diameter = radius * 2.0
+    coordinate = getattr(operator, "fit_radius_coordinate", 0.0)
+    slope = getattr(operator, "fit_slope", 0.0)
+    operator.diameter = max(1.0e-9, radius + slope * coordinate) * 2.0
     fit = getattr(operator, "_fit", None)
     if fit is not None:
         fit["radius"] = radius
@@ -73,8 +75,10 @@ class _PersistentPreview:
         self._numeric_input = operator._numeric_input
         self._diameter_text = operator._diameter_text
         self._depth_text = operator._depth_text
+        self._conic_angle_text = operator._conic_angle_text
         self._active_dimension = operator._active_dimension
         self.depth_valid = operator.depth_valid
+        self.angle_valid = operator.angle_valid
         self._draw_error_reported = False
         self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
             self._draw_preview, (), 'WINDOW', 'POST_PIXEL'
@@ -90,8 +94,10 @@ class _PersistentPreview:
         self._numeric_input = operator._numeric_input
         self._diameter_text = operator._diameter_text
         self._depth_text = operator._depth_text
+        self._conic_angle_text = operator._conic_angle_text
         self._active_dimension = operator._active_dimension
         self.depth_valid = operator.depth_valid
+        self.angle_valid = operator.angle_valid
         if context.area is not None:
             context.area.tag_redraw()
 
@@ -170,11 +176,11 @@ class MESH_OT_holey_tools_resize_hole(
     GpuPreviewMixin,
     bpy.types.Operator,
 ):
-    """Select one cylindrical wall, fit it, and resize it interactively.
+    """Select one circular wall, fit it, and resize it interactively.
 
     The modal operator has two stages. SELECT ray-casts beneath the pointer and
     displays a non-destructive flood fill. A click locks that region, fits the
-    cylinder, and enters CYLINDER, where typing or dragging updates dimensions.
+    cone, and enters CYLINDER, where typing or dragging updates dimensions.
     Confirmation hands plain drawing data to ``_PersistentPreview`` so Blender's
     Redo panel can continue changing the completed operation safely.
     """
@@ -183,13 +189,13 @@ class MESH_OT_holey_tools_resize_hole(
     bl_label = "Resize Hole"
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
     bl_description = (
-        "Hover to flood-fill a cylindrical wall, click to fit a cylinder, "
+        "Hover to flood-fill a circular wall, click to fit its cone or cylinder, "
         "then click again to apply"
     )
 
     scale: bpy.props.FloatProperty(
         name="Scale",
-        description="Internal radius scale relative to the fitted cylinder",
+        description="Internal radius scale relative to the fitted wall",
         default=1.0,
         min=0.01,
         max=10.0,
@@ -210,6 +216,14 @@ class MESH_OT_holey_tools_resize_hole(
         min=0.0,
         subtype='DISTANCE',
         unit='LENGTH',
+    )
+    conic_angle: bpy.props.FloatProperty(
+        name="Conic Angle",
+        description="Half-angle between the fitted conic wall and its axis",
+        default=0.0,
+        min=0.0,
+        max=math.radians(89.0),
+        subtype='ANGLE',
     )
     flood_angle: bpy.props.FloatProperty(
         name="Flood Angle",
@@ -247,6 +261,9 @@ class MESH_OT_holey_tools_resize_hole(
     fit_radius_minimum: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_radius_average: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_radius_maximum: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    fit_slope: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    fit_radius_coordinate: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    fit_is_cone: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_z_min: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_z_max: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_is_stud: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})
@@ -254,6 +271,7 @@ class MESH_OT_holey_tools_resize_hole(
         default="", options={'HIDDEN', 'SKIP_SAVE'}
     )
     depth_valid: bpy.props.BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
+    angle_valid: bpy.props.BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
     fit_depth_initial: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_depth_outer: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_depth_inner: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
@@ -285,6 +303,7 @@ class MESH_OT_holey_tools_resize_hole(
     _numeric_replace = True
     _diameter_text = ""
     _depth_text = ""
+    _conic_angle_text = ""
     _active_dimension = 'DIAMETER'
     _drag_active = False
     _drag_moved = False
@@ -318,6 +337,8 @@ class MESH_OT_holey_tools_resize_hole(
         row.prop(self, "diameter")
         if self.depth_valid:
             self.layout.prop(self, "depth")
+        if self.angle_valid:
+            self.layout.prop(self, "conic_angle")
 
     @staticmethod
     def _tag_redraw(context):
@@ -358,7 +379,7 @@ class MESH_OT_holey_tools_resize_hole(
             self._draw_handle = None
 
     def _end_modal_with_persistent_preview(self, context):
-        """Leave modal interaction while preserving its cylinder overlay.
+        """Leave modal interaction while preserving its cone/cylinder overlay.
 
         The live draw handler is removed before its plain coordinate data is
         copied into a new persistent preview. The caller then executes and
@@ -425,9 +446,16 @@ class MESH_OT_holey_tools_resize_hole(
             dimensions = f"Diameter: {self._diameter_text}"
             if self.depth_valid:
                 dimensions += f"  •  Depth: {self._depth_text}"
+            if self.angle_valid:
+                dimensions += f"  •  Conic Angle: {self._conic_angle_text}"
+            step_hint = (
+                "+/-: 1° (Shift: 0.1°)"
+                if self._active_dimension == 'ANGLE'
+                else "+/-: 1 mm (Shift: 0.1 mm)"
+            )
             context.workspace.status_text_set(
                 f"{dimensions}  •  Active: {active}  •  Type to replace  •  "
-                "+/-: 1 mm (Shift: 0.1 mm)  •  "
+                f"{step_hint}  •  "
                 "Touch handle: select/adjust  •  Ctrl: invert 0.1 mm snap  •  "
                 "Shift: fine  •  "
                 "MMB/Wheel/Trackpad/3D Mouse: navigate  •  "
@@ -626,8 +654,17 @@ class MESH_OT_holey_tools_resize_hole(
         as compact JSON.
         """
         fit = self._fit
+        self._depth_fit = self._fit_adjustable_depth(
+            self._end_planes or (), fit
+        )
+        self.depth_valid = self._depth_fit is not None
+        fit["radius_coordinate"] = (
+            self._depth_fit["outer_coordinate"] if self._depth_fit else 0.0
+        )
         self.scale = 1.0
-        self.diameter = fit["radius"] * 2.0
+        self.diameter = self._fitted_radius_at(fit["radius_coordinate"]) * 2.0
+        self.angle_valid = bool(fit.get("is_cone", False))
+        self.conic_angle = float(fit.get("half_angle", 0.0))
         self.fit_valid = True
         self.fit_face_indices = ",".join(str(index) for index in sorted(self._locked_indices))
         self.fit_axis = fit["axis"]
@@ -639,6 +676,9 @@ class MESH_OT_holey_tools_resize_hole(
         self.fit_radius_minimum = estimates['MINIMUM']
         self.fit_radius_average = estimates['AVERAGE']
         self.fit_radius_maximum = estimates['MAXIMUM']
+        self.fit_slope = fit.get("slope", 0.0)
+        self.fit_radius_coordinate = fit["radius_coordinate"]
+        self.fit_is_cone = fit.get("is_cone", False)
         self.fit_z_min = fit["z_min"]
         self.fit_z_max = fit["z_max"]
         self.fit_is_stud = fit.get("is_stud", False)
@@ -660,10 +700,6 @@ class MESH_OT_holey_tools_resize_hole(
             ],
             separators=(",", ":"),
         )
-        self._depth_fit = self._fit_adjustable_depth(
-            self._end_planes or (), fit
-        )
-        self.depth_valid = self._depth_fit is not None
         if self.depth_valid:
             self.depth = self._depth_fit["initial"]
             self.fit_depth_initial = self._depth_fit["initial"]
@@ -703,6 +739,10 @@ class MESH_OT_holey_tools_resize_hole(
                 'AVERAGE': self.fit_radius_average,
                 'MAXIMUM': self.fit_radius_maximum,
             },
+            "slope": self.fit_slope,
+            "half_angle": math.atan(abs(self.fit_slope)),
+            "is_cone": self.fit_is_cone,
+            "radius_coordinate": self.fit_radius_coordinate,
             "z_min": self.fit_z_min,
             "z_max": self.fit_z_max,
             "is_stud": self.fit_is_stud,
@@ -742,6 +782,7 @@ class MESH_OT_holey_tools_resize_hole(
         else:
             self._depth_fit = None
             self.depth_valid = False
+        self.angle_valid = bool(self.fit_is_cone)
         self._stage = 'CYLINDER'
         return True
 
@@ -775,6 +816,10 @@ class MESH_OT_holey_tools_resize_hole(
         """Format the current depth for numeric input and overlays."""
         return self._format_dimension(context, self.depth)
 
+    def _format_conic_angle(self):
+        """Format the conic half-angle for numeric input and overlays."""
+        return f"{math.degrees(self.conic_angle):.6g}°"
+
     def _parse_dimension(self, context, text):
         """Parse user-entered dimension text into Blender world-space units.
 
@@ -800,16 +845,32 @@ class MESH_OT_holey_tools_resize_hole(
         """Retain the diameter parser name for compatibility with older redo state."""
         return self._parse_dimension(context, text)
 
+    @staticmethod
+    def _parse_angle(text):
+        """Parse a user-facing conic angle in degrees."""
+        normalized = text.strip().lower().replace(',', '.')
+        normalized = normalized.removesuffix("degrees").removesuffix("degree")
+        normalized = normalized.removesuffix("deg").removesuffix("°").strip()
+        if not normalized:
+            raise ValueError("Empty angle")
+        return math.radians(float(normalized))
+
     def _active_dimension_value(self):
         """Return the value controlled by the most recently touched handle."""
-        if getattr(self, "_active_dimension", 'DIAMETER') == 'DEPTH':
+        active = getattr(self, "_active_dimension", 'DIAMETER')
+        if active == 'DEPTH':
             return self.depth
+        if active == 'ANGLE':
+            return self.conic_angle
         return self.diameter
 
     def _set_active_dimension_value(self, value):
         """Assign the most recently touched dimension."""
-        if getattr(self, "_active_dimension", 'DIAMETER') == 'DEPTH':
+        active = getattr(self, "_active_dimension", 'DIAMETER')
+        if active == 'DEPTH':
             self.depth = value
+        elif active == 'ANGLE':
+            self.conic_angle = min(math.radians(89.0), max(0.0, value))
         else:
             self.diameter = value
 
@@ -826,17 +887,25 @@ class MESH_OT_holey_tools_resize_hole(
             if active == 'DEPTH'
             else self._format_depth(context)
         ) if self.depth_valid else ""
+        self._conic_angle_text = (
+            self._numeric_input
+            if active == 'ANGLE'
+            else self._format_conic_angle()
+        ) if getattr(self, "angle_valid", False) else ""
 
     def _activate_dimension(self, context, dimension):
         """Make a handle the target for subsequent typing, stepping, and drag."""
         if dimension == 'DEPTH' and not self.depth_valid:
             dimension = 'DIAMETER'
+        if dimension == 'ANGLE' and not self.angle_valid:
+            dimension = 'DIAMETER'
         self._active_dimension = dimension
-        self._numeric_reference = (
-            self._format_depth(context)
-            if dimension == 'DEPTH'
-            else self._format_diameter(context)
-        )
+        if dimension == 'DEPTH':
+            self._numeric_reference = self._format_depth(context)
+        elif dimension == 'ANGLE':
+            self._numeric_reference = self._format_conic_angle()
+        else:
+            self._numeric_reference = self._format_diameter(context)
         self._numeric_input = self._numeric_reference
         self._numeric_replace = True
         self._sync_dimension_text(context)
@@ -848,18 +917,24 @@ class MESH_OT_holey_tools_resize_hole(
         self._activate_dimension(context, 'DIAMETER')
 
     def _update_numeric_preview(self, context):
-        """Apply valid positive input immediately to the mesh and GPU cylinder.
+        """Apply valid input immediately to the mesh and GPU cone/cylinder.
 
         Incomplete or invalid text remains visible for continued editing but does
         not disturb the last valid geometry.
         """
         try:
-            value = self._parse_dimension(context, self._numeric_input)
+            value = (
+                self._parse_angle(self._numeric_input)
+                if self._active_dimension == 'ANGLE'
+                else self._parse_dimension(context, self._numeric_input)
+            )
         except (TypeError, ValueError):
             self._sync_dimension_text(context)
             self._set_status_text(context)
             return
-        if value <= 0.0:
+        if value < 0.0 or (
+            self._active_dimension != 'ANGLE' and value <= 0.0
+        ):
             self._sync_dimension_text(context)
             self._set_status_text(context)
             return
@@ -871,14 +946,20 @@ class MESH_OT_holey_tools_resize_hole(
 
     def _step_dimension(self, context, direction, fine_adjustment=False):
         """Step the active dimension by one millimeter, or a tenth with Shift."""
-        _system, scale = self._scene_unit_info(context)
-        millimeters = 0.1 if fine_adjustment else 1.0
-        step = millimeters * 0.001 / scale
+        if self._active_dimension == 'ANGLE':
+            step = math.radians(0.1 if fine_adjustment else 1.0)
+        else:
+            _system, scale = self._scene_unit_info(context)
+            millimeters = 0.1 if fine_adjustment else 1.0
+            step = millimeters * 0.001 / scale
+        minimum = 0.0 if self._active_dimension == 'ANGLE' else 1.0e-9
         self._set_active_dimension_value(
-            max(1.0e-9, self._active_dimension_value() + direction * step)
+            max(minimum, self._active_dimension_value() + direction * step)
         )
-        self._numeric_reference = self._format_dimension(
-            context, self._active_dimension_value()
+        self._numeric_reference = (
+            self._format_conic_angle()
+            if self._active_dimension == 'ANGLE'
+            else self._format_dimension(context, self._active_dimension_value())
         )
         self._numeric_input = self._numeric_reference
         self._numeric_replace = True
@@ -966,25 +1047,38 @@ class MESH_OT_holey_tools_resize_hole(
         increments independently of the scene's displayed unit scale.
         """
         ui_scale = _ui_scale()
-        if self._active_dimension == 'DEPTH':
-            delta = event.mouse_y - self._drag_start_y
+        active = self._active_dimension
+        if active == 'DEPTH':
+            # Window-space Y increases upward, while dragging the depth handle
+            # downward should make the hole deeper.
+            delta = self._drag_start_y - event.mouse_y
         else:
             delta = event.mouse_x - self._drag_start_x
         if abs(delta) >= 3.0 * ui_scale:
             self._drag_moved = True
         divisor = (1000.0 if event.shift else 200.0) * ui_scale
-        value = self._drag_start_value * (2.0 ** (delta / divisor))
+        if active == 'ANGLE':
+            angle_divisor = (20.0 if event.shift else 4.0) * ui_scale
+            value = self._drag_start_value + math.radians(delta / angle_divisor)
+            value = min(math.radians(89.0), max(0.0, value))
+        else:
+            value = self._drag_start_value * (2.0 ** (delta / divisor))
         snap_enabled = bool(context.scene.tool_settings.use_snap) != bool(event.ctrl)
         if snap_enabled:
-            # Blender stores length in scene units. Snap the physical result to
-            # tenths of a millimeter regardless of the displayed unit system.
-            _system, scale = self._scene_unit_info(context)
-            snap_step = 0.0001 / scale
+            if active == 'ANGLE':
+                snap_step = math.radians(0.1)
+            else:
+                # Blender stores length in scene units. Snap the physical result
+                # to tenths of a millimeter in every displayed unit system.
+                _system, scale = self._scene_unit_info(context)
+                snap_step = 0.0001 / scale
             value = round(value / snap_step) * snap_step
-            value = max(snap_step, value)
-        self._set_active_dimension_value(max(1.0e-9, value))
-        self._numeric_reference = self._format_dimension(
-            context, self._active_dimension_value()
+            value = max(0.0 if active == 'ANGLE' else snap_step, value)
+        self._set_active_dimension_value(max(0.0 if active == 'ANGLE' else 1.0e-9, value))
+        self._numeric_reference = (
+            self._format_conic_angle()
+            if active == 'ANGLE'
+            else self._format_dimension(context, self._active_dimension_value())
         )
         self._numeric_input = self._numeric_reference
         self._numeric_replace = True
@@ -996,7 +1090,7 @@ class MESH_OT_holey_tools_resize_hole(
     def _lock_selection_and_fit(self, context, build_preview=True):
         """Commit the hover region and initialize dimension-editing state.
 
-        The method fits the cylinder and boundary planes, makes the candidate
+        The method fits the circular cone and boundary planes, makes the candidate
         faces Blender's real selection, captures original/proportional vertex
         state, serializes the fit for Redo, and enters CYLINDER. It returns
         ``False`` without changing stages when no stable fit can be produced.
@@ -1019,7 +1113,7 @@ class MESH_OT_holey_tools_resize_hole(
 
         self._locked_indices = set(self._candidate_indices)
         self._fit = fit
-        self._end_planes = self._fit_boundary_planes(faces, fit["axis"])
+        self._end_planes = self._fit_boundary_planes(faces, fit["axis"], fit)
         selected_verts = {vert for face in faces for vert in face.verts}
         self._capture_deformation_state(context, bm, selected_verts)
         self._store_fit_for_redo()
@@ -1039,7 +1133,7 @@ class MESH_OT_holey_tools_resize_hole(
         """
         global _persistent_preview
         if (self._fit is None or not self._locked_indices) and not self._restore_fit_for_redo():
-            self.report({'WARNING'}, "Choose a cylindrical wall first")
+            self.report({'WARNING'}, "Choose a cylindrical or conical wall first")
             return {'CANCELLED'}
 
         MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(self, context)
@@ -1049,10 +1143,15 @@ class MESH_OT_holey_tools_resize_hole(
         if _persistent_preview is not None:
             # Redo-panel edits update RNA properties directly rather than passing
             # through modal input. Keep both overlay values synchronized.
-            if self._active_dimension == 'DEPTH' and not self.depth_valid:
+            if (
+                (self._active_dimension == 'DEPTH' and not self.depth_valid)
+                or (self._active_dimension == 'ANGLE' and not self.angle_valid)
+            ):
                 self._active_dimension = 'DIAMETER'
-            self._numeric_input = self._format_dimension(
-                context, self._active_dimension_value()
+            self._numeric_input = (
+                self._format_conic_angle()
+                if self._active_dimension == 'ANGLE'
+                else self._format_dimension(context, self._active_dimension_value())
             )
             self._numeric_reference = self._numeric_input
             self._sync_dimension_text(context)
@@ -1104,6 +1203,7 @@ class MESH_OT_holey_tools_resize_hole(
                 cursor = {
                     'DIAMETER': 'SCROLL_X',
                     'DEPTH': 'SCROLL_Y',
+                    'ANGLE': 'SCROLL_X',
                 }.get(hovered_dimension, 'CROSSHAIR')
                 context.window.cursor_modal_set(cursor)
 
@@ -1203,9 +1303,14 @@ class MESH_OT_holey_tools_resize_hole(
         self.scale = 1.0
         self.diameter = 0.0
         self.depth = 0.0
+        self.conic_angle = 0.0
         self.fit_valid = False
         self.depth_valid = False
+        self.angle_valid = False
         self.fit_is_stud = False
+        self.fit_is_cone = False
+        self.fit_slope = 0.0
+        self.fit_radius_coordinate = 0.0
         self.fit_depth_initial = 0.0
         self.fit_depth_outer = 0.0
         self.fit_depth_inner = 0.0
@@ -1218,6 +1323,7 @@ class MESH_OT_holey_tools_resize_hole(
         self._numeric_replace = True
         self._diameter_text = ""
         self._depth_text = ""
+        self._conic_angle_text = ""
         self._active_dimension = 'DIAMETER'
         self._angle_numeric_input = f"{math.degrees(self.flood_angle):.1f}"
         self._angle_numeric_replace = True

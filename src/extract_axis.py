@@ -13,7 +13,7 @@ from bpy_extras import view3d_utils
 from mathutils.bvhtree import BVHTree
 
 from . import operator as resize_runtime
-from .axis_nodes import ensure_axis_node_group
+from .axis_nodes import ensure_axis_modifier
 from .constants import (
     ADDON_VERSION,
     AXIS_FACE_ATTRIBUTE,
@@ -77,14 +77,14 @@ class MESH_OT_holey_tools_extract_axis(
     GpuPreviewMixin,
     bpy.types.Operator,
 ):
-    """Flood-fill faces and publish them for Geometry Nodes axis extraction."""
+    """Flood-fill faces and add a Geometry Nodes cone-axis modifier."""
 
     bl_idname = "mesh.holey_tools_extract_axis"
     bl_label = "Extract Axis"
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
     bl_description = (
-        "Flood-fill a region, store it as a named face group, and create a "
-        "Geometry Nodes principal-axis group"
+        "Flood-fill a region, store it as a named face group, and add a "
+        "Geometry Nodes fitted-axis modifier"
     )
 
     flood_angle: bpy.props.FloatProperty(
@@ -360,7 +360,7 @@ class MESH_OT_holey_tools_extract_axis(
         return self.execute(context)
 
     def execute(self, context):
-        """Write the face group and ensure the principal-axis node group exists."""
+        """Write the face group and install the fitted-axis modifier."""
         obj = context.active_object
         if obj is None or obj.type != 'MESH':
             self.report({'WARNING'}, "Extract Axis needs an active mesh")
@@ -377,13 +377,13 @@ class MESH_OT_holey_tools_extract_axis(
             return {'CANCELLED'}
         try:
             assign_axis_face_group(obj, indices, self.attribute_name)
-            node_group = ensure_axis_node_group(self.attribute_name.strip())
+            modifier = ensure_axis_modifier(obj, self.attribute_name.strip())
         except (RuntimeError, TypeError, ValueError) as error:
             self.report({'WARNING'}, str(error))
             return {'CANCELLED'}
         self.report(
             {'INFO'},
-            f"Stored '{self.attribute_name.strip()}' for node group '{node_group.name}'",
+            f"Stored '{self.attribute_name.strip()}' and added '{modifier.name}'",
         )
         return {'FINISHED'}
 

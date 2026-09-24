@@ -1,0 +1,103 @@
+#!/bin/sh
+
+set -eu
+
+usage() {
+    printf 'Usage: %s [VERSION]\n' "$0" >&2
+    printf 'VERSION must have the form #.#.#. Without it, the newest matching Git tag is used.\n' >&2
+}
+
+fail() {
+    printf 'build: %s\n' "$1" >&2
+    exit 1
+}
+
+if [ "$#" -gt 1 ]; then
+    usage
+    exit 2
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ "$#" -eq 1 ]; then
+    version=$1
+else
+    command -v git >/dev/null 2>&1 || fail "git is required to determine the release version"
+    tags=$(git -C "$script_dir" for-each-ref \
+        --merged=HEAD \
+        --sort=-creatordate \
+        '--format=%(refname:strip=2)' \
+        refs/tags) || fail "could not read Git tags"
+    version=$(printf '%s\n' "$tags" | awk '/^[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')
+    [ -n "$version" ] || fail "no reachable Git tag matching #.#.# was found"
+fi
+
+case $version in
+    *[!0-9.]* | .* | *. | *..*)
+        fail "version '$version' must have the form #.#.#"
+        ;;
+esac
+
+old_ifs=$IFS
+IFS=.
+set -- $version
+IFS=$old_ifs
+[ "$#" -eq 3 ] || fail "version '$version' must have the form #.#.#"
+major=$1
+minor=$2
+patch=$3
+[ -n "$major" ] && [ -n "$minor" ] && [ -n "$patch" ] \
+    || fail "version '$version' must have the form #.#.#"
+
+if [ -n "${BLENDER:-}" ]; then
+    blender=$BLENDER
+elif command -v blender >/dev/null 2>&1; then
+    blender=$(command -v blender)
+elif [ -x /Applications/Blender.app/Contents/MacOS/blender ]; then
+    blender=/Applications/Blender.app/Contents/MacOS/blender
+else
+    fail "Blender was not found; put it on PATH or set BLENDER to its executable"
+fi
+
+temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/holey-tools-build.XXXXXX")
+cleanup() {
+    rm -rf -- "$temp_dir"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+cp -R "$script_dir/src" "$temp_dir/src"
+
+replace_line() {
+    file=$1
+    pattern=$2
+    replacement=$3
+    awk -v pattern="$pattern" -v replacement="$replacement" '
+        $0 ~ pattern && !replaced {
+            print replacement
+            replaced = 1
+            next
+        }
+        { print }
+        END { if (!replaced) exit 1 }
+    ' "$file" > "$file.tmp" || fail "could not set the version in $file"
+    mv "$file.tmp" "$file"
+}
+
+replace_line \
+    "$temp_dir/src/blender_manifest.toml" \
+    '^version = "[^"]*"$' \
+    "version = \"$version\""
+replace_line \
+    "$temp_dir/src/constants.py" \
+    '^ADDON_VERSION = "[^"]*"$' \
+    "ADDON_VERSION = \"$version\""
+replace_line \
+    "$temp_dir/src/__init__.py" \
+    '^    "version": (.*),$' \
+    "    \"version\": ($major, $minor, $patch),"
+
+printf 'Building Holey Tools %s...\n' "$version"
+"$blender" --command extension build \
+    --source-dir "$temp_dir/src" \
+    --output-dir "$script_dir"
