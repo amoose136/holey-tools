@@ -17,6 +17,17 @@ from src.operator import (  # noqa: E402
 )
 
 
+resize_properties = MESH_OT_holey_tools_resize_hole.__annotations__
+for property_name in (
+    "fairing_method",
+    "fill_style",
+    "circle_loops",
+    "grid_angle",
+    "final_simplify",
+):
+    assert property_name in resize_properties, property_name
+
+
 assert ord(DIAMETER_SYMBOL) == 0x00D8, repr(DIAMETER_SYMBOL)
 
 for navigation_event in (
@@ -302,14 +313,90 @@ operator._fit = MESH_OT_holey_tools_resize_hole._fit_cylinder(operator, list(flo
 assert abs(operator._fit["radius"] - 2.0) < 1.0e-6, operator._fit
 assert abs(abs(operator._fit["axis"].z) - 1.0) < 1.0e-6, operator._fit
 
+# A serialized redo resolution is authoritative even if the current topology
+# would lead transient state reconstruction to infer a different value.
+operator.fit_valid = True
+operator.fit_angular_segments = 12
+MESH_OT_holey_tools_resize_hole._build_resize_projection_state(
+    operator, bm, list(flood)
+)
+assert operator._resize_angular_segments == 12
+operator.fit_valid = False
+operator.fit_angular_segments = 0
+operator._resize_angular_segments = 0
+
+# The same value survives the complete hidden-RNA store/restore path used by
+# Blender's Adjust Last Operation panel.
+operator._end_planes = []
+operator._resize_requires_boolean = False
+operator._resize_angular_segments = 16
+MESH_OT_holey_tools_resize_hole._store_fit_for_redo(operator)
+assert operator.fit_angular_segments == 16
+assert operator.boolean_segments == 16
+operator._fit = None
+operator._locked_indices = set()
+operator._resize_angular_segments = 0
+assert MESH_OT_holey_tools_resize_hole._restore_fit_for_redo(operator)
+assert operator._resize_angular_segments == 16
+
 # Exercise the extracted GPU-preview geometry builder without requiring a window.
 operator.diameter = 0.0
 operator._fill_batch = None
 operator._line_batch = None
 operator._tag_redraw = lambda _context: None
 MESH_OT_holey_tools_resize_hole._build_cylinder_preview(operator, bpy.context)
-assert len(operator._fill_coords) == 128, len(operator._fill_coords)
-assert len(operator._line_coords) == 128, len(operator._line_coords)
+assert len(operator._fill_coords) == 16 * 2, len(operator._fill_coords)
+assert len(operator._line_coords) == 16 * 2, len(operator._line_coords)
+operator.boolean_segments = 9
+MESH_OT_holey_tools_resize_hole._build_cylinder_preview(operator, bpy.context)
+assert len(operator._fill_coords) == 9 * 2, len(operator._fill_coords)
+assert len(operator._line_coords) == 9 * 2, len(operator._line_coords)
+operator.boolean_segments = 16
+
+# Reconstruction depth fixes the preview at the fitted exterior-surface basis
+# point and moves only the blind end, independently of the wall fit bounds.
+operator._depth_fit = {
+    "initial": 2.0,
+    "outer_coordinate": 1.25,
+    "inner_coordinate": -0.75,
+    "surface_depth": True,
+}
+operator.depth = 1.0
+operator._target_depth_scale = lambda: (
+    MESH_OT_holey_tools_resize_hole._target_depth_scale(operator)
+)
+MESH_OT_holey_tools_resize_hole._build_cylinder_preview(operator, bpy.context)
+preview_coordinates = {
+    round((point - operator._fit["center"]).dot(operator._fit["axis"]), 6)
+    for triangle in operator._fill_coords
+    for point in triangle
+}
+assert preview_coordinates == {0.25, 1.25}, preview_coordinates
+operator._depth_fit = None
+
+# Boolean reconstruction simplifies a blind base only when its fitted depth is
+# unchanged. A preserved, non-adjustable blind coordinate pair is unchanged by
+# definition; through holes have no base to simplify.
+unchanged_depth = SimpleNamespace(
+    _depth_fit={"initial": 2.0},
+    depth=2.0,
+)
+changed_depth = SimpleNamespace(
+    _depth_fit={"initial": 2.0},
+    depth=1.5,
+)
+assert MESH_OT_holey_tools_resize_hole._boolean_depth_unchanged(
+    unchanged_depth, None
+)
+assert not MESH_OT_holey_tools_resize_hole._boolean_depth_unchanged(
+    changed_depth, None
+)
+assert MESH_OT_holey_tools_resize_hole._boolean_depth_unchanged(
+    SimpleNamespace(_depth_fit=None), (0.0, 1.0)
+)
+assert not MESH_OT_holey_tools_resize_hole._boolean_depth_unchanged(
+    SimpleNamespace(_depth_fit=None), None
+)
 
 # Give the upper boundary an oblique cut, fit both end surfaces, and verify that
 # radial resizing projects the boundary back along the cylinder axis.
@@ -326,6 +413,9 @@ nonparallel_depth = MESH_OT_holey_tools_resize_hole._fit_adjustable_depth(
 assert nonparallel_depth is not None
 assert not nonparallel_depth["parallel"]
 
+operator._resize_requires_boolean = False
+operator._resize_angular_segments = 16
+MESH_OT_holey_tools_resize_hole._store_fit_for_redo(operator)
 operator.scale = 1.0
 operator.diameter = 6.0
 assert abs(MESH_OT_holey_tools_resize_hole._target_scale(operator) - 1.5) < 1.0e-6

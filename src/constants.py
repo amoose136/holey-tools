@@ -16,7 +16,7 @@ AXIS_NODE_GROUP_NAME = "Holey Tools Extract Axis"
 # angular epsilon records whether the accepted planes are effectively parallel.
 PLANE_FIT_ABSOLUTE_EPSILON = 1.0e-6
 PLANE_FIT_RELATIVE_EPSILON = 1.0e-5
-PARALLEL_PLANE_ANGLE_EPSILON = math.radians(0.1)
+PARALLEL_PLANE_ANGLE_EPSILON = math.radians(0.4)
 
 VIEW_NAVIGATION_EVENTS = frozenset({
     'MIDDLEMOUSE',

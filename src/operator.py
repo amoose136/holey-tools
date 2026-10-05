@@ -21,6 +21,7 @@ from .constants import (
     FLOOD_ANGLE_HUD_SECONDS,
     VIEW_NAVIGATION_EVENTS,
 )
+from .fairing import FairingError
 from .geometry import GeometryMixin
 from .gpu_preview import GpuPreviewMixin, _ui_scale
 
@@ -241,6 +242,62 @@ class MESH_OT_holey_tools_resize_hole(
         update=_update_diameter_estimator,
         options={'SKIP_SAVE'},
     )
+    fairing_method: bpy.props.EnumProperty(
+        name="Reconstruction Surface",
+        description="Surface model used to reconstruct the mesh before Boolean cutting",
+        items=(
+            ('AUTO', "Auto", "Use the accepted automatic fit"),
+            ('PLANES', "N-Plane", "Fit one to three adjacent planes"),
+            ('CYLINDER', "Cylinder", "Force a zero-slope circular-cylinder fit"),
+            ('SPHERE', "Sphere", "Force a spherical fit"),
+            ('ORGANIC', "Organic", "Use thin-plate surface continuation"),
+        ),
+        default='AUTO',
+    )
+    fill_style: bpy.props.EnumProperty(
+        name="Reconstruction Fill",
+        description="Topology used to reconstruct the old opening",
+        items=(
+            ('AUTO', "Auto", "Use the topology associated with the surface fit"),
+            ('GRID', "Grid", "Clip a source-aligned grid to the opening"),
+            ('CIRCLE', "Circle", "Use concentric rings and a center fan"),
+        ),
+        default='AUTO',
+    )
+    circle_loops: bpy.props.IntProperty(
+        name="Circle Loops",
+        description="Concentric reconstruction loops before the center fan",
+        default=2,
+        min=0,
+        max=64,
+    )
+    grid_angle: bpy.props.FloatProperty(
+        name="Grid Angle Offset",
+        description="Rotate the reconstruction grid from its inferred alignment",
+        default=0.0,
+        subtype='ANGLE',
+        soft_min=-math.pi * 0.5,
+        soft_max=math.pi * 0.5,
+    )
+    final_simplify: bpy.props.BoolProperty(
+        name="Final Simplify",
+        description="Simplify the resized Boolean result after reconstruction",
+        default=True,
+    )
+    boolean_segments: bpy.props.IntProperty(
+        name="Boolean Segments",
+        description="Number of radial segments in the final Boolean cutter",
+        default=32,
+        min=3,
+        max=512,
+        soft_max=128,
+    )
+    reconstruction_result_method: bpy.props.StringProperty(
+        default="", options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    reconstruction_result_fill_style: bpy.props.StringProperty(
+        default="", options={'HIDDEN', 'SKIP_SAVE'}
+    )
     fit_valid: bpy.props.BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
     fit_face_indices: bpy.props.StringProperty(
         default="", options={'HIDDEN', 'SKIP_SAVE'}
@@ -267,6 +324,21 @@ class MESH_OT_holey_tools_resize_hole(
     fit_z_min: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_z_max: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_is_stud: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    fit_angular_segments: bpy.props.IntProperty(
+        default=0, min=0, options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    fit_mesh_vertex_count: bpy.props.IntProperty(
+        default=0, min=0, options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    fit_mesh_edge_count: bpy.props.IntProperty(
+        default=0, min=0, options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    fit_mesh_face_count: bpy.props.IntProperty(
+        default=0, min=0, options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    fit_mesh_topology_signature: bpy.props.StringProperty(
+        default="", options={'HIDDEN', 'SKIP_SAVE'}
+    )
     fit_end_planes: bpy.props.StringProperty(
         default="", options={'HIDDEN', 'SKIP_SAVE'}
     )
@@ -297,6 +369,17 @@ class MESH_OT_holey_tools_resize_hole(
     _fit = None
     _end_planes = None
     _depth_fit = None
+    _resize_projection_ready = False
+    _resize_requires_boolean = False
+    _resize_dynamic_requires_boolean = False
+    _resize_surfaces_by_vertex = None
+    _resize_base_bvh = None
+    _resize_base_span = 0.0
+    _resize_angular_segments = 0
+    _boolean_preview_source = None
+    _boolean_preview_segments = 0
+    _boolean_preview_last_update = 0.0
+    _boolean_preview_pending = False
     _stage = 'SELECT'
     _numeric_input = ""
     _numeric_reference = ""
@@ -339,6 +422,33 @@ class MESH_OT_holey_tools_resize_hole(
             self.layout.prop(self, "depth")
         if self.angle_valid:
             self.layout.prop(self, "conic_angle")
+        if getattr(self, "_resize_requires_boolean", False):
+            box = self.layout.box()
+            box.label(text="Reconstruction: Exact Boolean", icon='MOD_BOOLEAN')
+            box.prop(self, "boolean_segments")
+            box.prop(self, "fairing_method")
+            box.prop(self, "fill_style")
+            effective_fill = (
+                self.fill_style
+                if self.fill_style != 'AUTO'
+                else self.reconstruction_result_fill_style
+            )
+            if effective_fill == 'CIRCLE':
+                box.prop(self, "circle_loops")
+            elif effective_fill == 'GRID':
+                box.prop(self, "grid_angle")
+            box.prop(self, "final_simplify")
+            if self.reconstruction_result_method:
+                box.label(
+                    text=f"Surface result: {self.reconstruction_result_method.title()}"
+                )
+            if self.reconstruction_result_fill_style:
+                box.label(
+                    text=(
+                        "Fill result: "
+                        f"{self.reconstruction_result_fill_style.title()}"
+                    )
+                )
 
     @staticmethod
     def _tag_redraw(context):
@@ -408,6 +518,11 @@ class MESH_OT_holey_tools_resize_hole(
 
     def _restore_original_geometry(self):
         """Restore captured object-local vertex positions after cancellation."""
+        if getattr(self, "_boolean_preview_source", None) is not None:
+            GeometryMixin._replace_boolean_preview_with_source(
+                self, consume=True
+            )
+            return
         if self._object is None or not self._original_vertex_coords:
             return
         bm = bmesh.from_edit_mesh(self._object.data)
@@ -448,6 +563,8 @@ class MESH_OT_holey_tools_resize_hole(
                 dimensions += f"  •  Depth: {self._depth_text}"
             if self.angle_valid:
                 dimensions += f"  •  Conic Angle: {self._conic_angle_text}"
+            if getattr(self, "_resize_requires_boolean", False):
+                dimensions += "  •  Rebuild: Exact Boolean"
             step_hint = (
                 "+/-: 1° (Shift: 0.1°)"
                 if self._active_dimension == 'ANGLE'
@@ -654,15 +771,20 @@ class MESH_OT_holey_tools_resize_hole(
         as compact JSON.
         """
         fit = self._fit
-        self._depth_fit = self._fit_adjustable_depth(
-            self._end_planes or (), fit
-        )
+        if getattr(self, "_resize_requires_boolean", False):
+            self._depth_fit = GeometryMixin._fit_reconstruction_depth(self)
+        else:
+            self._depth_fit = GeometryMixin._fit_adjustable_depth(
+                self, self._end_planes or (), fit
+            )
         self.depth_valid = self._depth_fit is not None
         fit["radius_coordinate"] = (
             self._depth_fit["outer_coordinate"] if self._depth_fit else 0.0
         )
         self.scale = 1.0
-        self.diameter = self._fitted_radius_at(fit["radius_coordinate"]) * 2.0
+        self.diameter = GeometryMixin._fitted_radius_at(
+            self, fit["radius_coordinate"]
+        ) * 2.0
         self.angle_valid = bool(fit.get("is_cone", False))
         self.conic_angle = float(fit.get("half_angle", 0.0))
         self.fit_valid = True
@@ -682,6 +804,17 @@ class MESH_OT_holey_tools_resize_hole(
         self.fit_z_min = fit["z_min"]
         self.fit_z_max = fit["z_max"]
         self.fit_is_stud = fit.get("is_stud", False)
+        self.fit_angular_segments = max(
+            3, int(getattr(self, "_resize_angular_segments", 0) or 32)
+        )
+        source_mesh = self._object.data
+        self.fit_mesh_vertex_count = len(source_mesh.vertices)
+        self.fit_mesh_edge_count = len(source_mesh.edges)
+        self.fit_mesh_face_count = len(source_mesh.polygons)
+        self.fit_mesh_topology_signature = (
+            GeometryMixin._object_topology_signature(self._object)
+        )
+        self.boolean_segments = self.fit_angular_segments
         self.fit_end_planes = json.dumps(
             [
                 {
@@ -767,22 +900,36 @@ class MESH_OT_holey_tools_resize_hole(
             self._end_planes = []
         if (
             self.depth_valid
-            and len(self._end_planes) == 2
             and self.fit_depth_initial > 1.0e-12
-            and self.fit_depth_outer_plane in {0, 1}
+            and (
+                self.fit_depth_outer_plane == -1
+                or (
+                    len(self._end_planes) == 2
+                    and self.fit_depth_outer_plane in {0, 1}
+                )
+            )
         ):
+            surface_depth = self.fit_depth_outer_plane == -1
             self._depth_fit = {
                 "initial": self.fit_depth_initial,
                 "outer_coordinate": self.fit_depth_outer,
                 "inner_coordinate": self.fit_depth_inner,
                 "outer_plane_index": self.fit_depth_outer_plane,
-                "inner_plane_index": 1 - self.fit_depth_outer_plane,
+                "inner_plane_index": (
+                    -1
+                    if surface_depth
+                    else 1 - self.fit_depth_outer_plane
+                ),
                 "is_stud": self.fit_is_stud,
+                "surface_depth": surface_depth,
             }
         else:
             self._depth_fit = None
             self.depth_valid = False
         self.angle_valid = bool(self.fit_is_cone)
+        self._resize_angular_segments = max(
+            3, int(self.fit_angular_segments or 32)
+        )
         self._stage = 'CYLINDER'
         return True
 
@@ -1114,6 +1261,9 @@ class MESH_OT_holey_tools_resize_hole(
         self._locked_indices = set(self._candidate_indices)
         self._fit = fit
         self._end_planes = self._fit_boundary_planes(faces, fit["axis"], fit)
+        self._resize_projection_ready = False
+        self._resize_dynamic_requires_boolean = False
+        self._build_resize_projection_state(bm, faces)
         selected_verts = {vert for face in faces for vert in face.verts}
         self._capture_deformation_state(context, bm, selected_verts)
         self._store_fit_for_redo()
@@ -1124,6 +1274,45 @@ class MESH_OT_holey_tools_resize_hole(
         self._set_status_text(context)
         return True
 
+    def _bind_execute_object(self, active_object):
+        """Replace stale redo-time object and mesh references when necessary."""
+        # Blender may keep this operator wrapper for Adjust Last Operation after
+        # invalidating the Object RNA cached by the modal invocation. Always
+        # bind geometry work to the current context object. If it is not the
+        # same live RNA object, every transient BMesh/BVH reference belongs to
+        # the old mesh and must be rebuilt from the serialized redo properties.
+        try:
+            previous_pointer = (
+                self._object.as_pointer() if self._object is not None else 0
+            )
+        except ReferenceError:
+            previous_pointer = 0
+        object_changed = previous_pointer != active_object.as_pointer()
+        if object_changed:
+            GeometryMixin._discard_boolean_preview_source(self)
+        self._object = active_object
+        if object_changed:
+            MESH_OT_holey_tools_resize_hole._reset_execute_transients(self)
+        return object_changed
+
+    @staticmethod
+    def _reset_execute_transients(operator):
+        """Discard mesh-derived state before rebuilding a Redo execution."""
+        operator._fit = None
+        operator._end_planes = None
+        operator._depth_fit = None
+        operator._locked_indices = set()
+        operator._original_vertex_coords = None
+        operator._proportional_weights = None
+        operator._resize_projection_ready = False
+        operator._resize_requires_boolean = False
+        operator._resize_base_requires_boolean = False
+        operator._resize_dynamic_requires_boolean = False
+        operator._resize_surfaces_by_vertex = {}
+        operator._resize_base_bvh = None
+        operator._resize_base_span = 0.0
+        operator._resize_angular_segments = 0
+
     def execute(self, context):
         """Apply stored dimensions during confirmation or Redo execution.
 
@@ -1132,11 +1321,37 @@ class MESH_OT_holey_tools_resize_hole(
         newly executed value without retaining this operator wrapper.
         """
         global _persistent_preview
-        if (self._fit is None or not self._locked_indices) and not self._restore_fit_for_redo():
+        active_object = context.active_object
+        if (
+            active_object is None
+            or active_object.type != 'MESH'
+            or context.mode != 'EDIT_MESH'
+        ):
+            self.report({'WARNING'}, "Use Resize Hole in Mesh Edit Mode")
+            return {'CANCELLED'}
+
+        object_changed = MESH_OT_holey_tools_resize_hole._bind_execute_object(
+            self, active_object
+        )
+        if (
+            not object_changed
+            and getattr(self, "_boolean_preview_source", None) is not None
+        ):
+            GeometryMixin._replace_boolean_preview_with_source(
+                self, consume=True
+            )
+        MESH_OT_holey_tools_resize_hole._reset_execute_transients(self)
+        if not MESH_OT_holey_tools_resize_hole._restore_fit_for_redo(self):
             self.report({'WARNING'}, "Choose a cylindrical or conical wall first")
             return {'CANCELLED'}
 
-        MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(self, context)
+        try:
+            MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
+                self, context, commit_boolean=True
+            )
+        except FairingError as error:
+            self.report({'WARNING'}, str(error))
+            return {'CANCELLED'}
 
         # Rebuild on the current operator wrapper, then copy only plain Python GPU
         # data into the persistent preview. No RNA operator survives past redo.
@@ -1235,6 +1450,9 @@ class MESH_OT_holey_tools_resize_hole(
             and self._drag_active
         ):
             self._drag_active = False
+            if getattr(self, "_boolean_preview_pending", False):
+                self._apply_diameter_to_mesh(context)
+                self._set_status_text(context)
             return {'RUNNING_MODAL'}
 
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
@@ -1300,11 +1518,24 @@ class MESH_OT_holey_tools_resize_hole(
         self._fit = None
         self._end_planes = None
         self._depth_fit = None
+        self._resize_projection_ready = False
+        self._resize_requires_boolean = False
+        self._resize_dynamic_requires_boolean = False
+        self._resize_surfaces_by_vertex = {}
+        self._resize_base_bvh = None
+        self._resize_base_span = 0.0
+        self._resize_angular_segments = 0
+        self._boolean_preview_source = None
+        self._boolean_preview_segments = 0
+        self._boolean_preview_last_update = 0.0
+        self._boolean_preview_pending = False
         self.scale = 1.0
         self.diameter = 0.0
         self.depth = 0.0
         self.conic_angle = 0.0
         self.fit_valid = False
+        self.fit_angular_segments = 0
+        self.boolean_segments = 32
         self.depth_valid = False
         self.angle_valid = False
         self.fit_is_stud = False
@@ -1317,6 +1548,8 @@ class MESH_OT_holey_tools_resize_hole(
         self.fit_depth_outer_plane = 0
         self.fit_face_indices = ""
         self.fit_end_planes = ""
+        self.reconstruction_result_method = ""
+        self.reconstruction_result_fill_style = ""
         self._stage = 'SELECT'
         self._numeric_input = ""
         self._numeric_reference = ""

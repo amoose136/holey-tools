@@ -47,6 +47,10 @@ class VIEW3D_PT_holey_tools(bpy.types.Panel):
         layout.label(text="Click wall: apply and adjust")
 
         layout.separator()
+        layout.operator("mesh.holey_tools_fair_hole", icon='MOD_SMOOTH')
+        layout.label(text="Click boundary: fit and fair")
+
+        layout.separator()
         layout.label(text="Geometry Nodes", icon='NODETREE')
         layout.prop(
             context.scene,

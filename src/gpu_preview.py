@@ -161,8 +161,17 @@ class GpuPreviewMixin:
         if depth_fit:
             depth_scale = self._target_depth_scale()
             outer = depth_fit["outer_coordinate"]
-            z_min = outer + (z_min - outer) * depth_scale
-            z_max = outer + (z_max - outer) * depth_scale
+            if depth_fit.get("surface_depth", False):
+                # Reconstruction depth is measured from the fitted exterior
+                # surface. Keep that basis endpoint fixed while moving only
+                # the blind endpoint of the preview.
+                z_min = outer
+                z_max = outer + (
+                    depth_fit["inner_coordinate"] - outer
+                ) * depth_scale
+            else:
+                z_min = outer + (z_min - outer) * depth_scale
+                z_max = outer + (z_max - outer) * depth_scale
         target_radius_at = getattr(self, "_target_radius_at", None)
         if target_radius_at is None:
             radius = fit["radius"] * self._target_scale()
@@ -170,7 +179,19 @@ class GpuPreviewMixin:
         else:
             bottom_radius = target_radius_at(z_min)
             top_radius = target_radius_at(z_max)
-        segments = max(32, min(128, len(self._locked_indices) * 4))
+        segments = max(
+            3,
+            min(
+                512,
+                int(
+                    getattr(self, "_boolean_preview_segments", 0)
+                    or getattr(self, "boolean_segments", 0)
+                    or getattr(self, "_resize_angular_segments", 0)
+                    or len(self._locked_indices)
+                    or 32
+                ),
+            ),
+        )
         bottom = []
         top = []
 
@@ -276,14 +297,19 @@ class GpuPreviewMixin:
             except ReferenceError:
                 return
 
-        if not self._fill_coords:
+        if not self._fill_coords and not self._line_coords:
             if self._stage == 'SELECT':
                 _fill_color, line_color = _face_retopology_colors()
                 self._draw_flood_angle_label(region, line_color)
             return
 
-        projected_triangles = self._project_triangles(region, region_data)
-        if not projected_triangles:
+        projected_triangles = (
+            self._project_triangles(region, region_data)
+            if self._fill_coords
+            else []
+        )
+        projected_lines = self._project_lines(region, region_data)
+        if not projected_triangles and not projected_lines:
             return
 
         width = max(1, region.width)
@@ -300,7 +326,6 @@ class GpuPreviewMixin:
         # relying on Blender's implicit POST_PIXEL matrix state, which differs
         # between viewport backends in 5.2.
         label_points = projected_triangles
-        projected_lines = self._project_lines(region, region_data)
         if self._stage == 'CYLINDER':
             projected_lines.extend(_convex_hull_lines(projected_triangles))
 
@@ -308,8 +333,10 @@ class GpuPreviewMixin:
 
         fill_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         line_shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
-        fill_batch = batch_for_shader(
-            fill_shader, 'TRIS', {"pos": triangles}
+        fill_batch = (
+            batch_for_shader(fill_shader, 'TRIS', {"pos": triangles})
+            if triangles
+            else None
         )
         projected_lines = [to_ndc(point) for point in projected_lines]
         line_batch = (
@@ -330,8 +357,9 @@ class GpuPreviewMixin:
                 gpu.matrix.load_identity()
                 gpu.matrix.load_projection_matrix(Matrix.Identity(4))
 
-                fill_shader.uniform_float("color", fill_color)
-                fill_batch.draw(fill_shader)
+                if fill_batch is not None:
+                    fill_shader.uniform_float("color", fill_color)
+                    fill_batch.draw(fill_shader)
 
                 if line_batch is not None:
                     line_shader.uniform_float(
