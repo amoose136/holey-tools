@@ -3,8 +3,9 @@
 set -eu
 
 usage() {
-    printf 'Usage: %s [VERSION]\n' "$0" >&2
+    printf 'Usage: %s [--development-controls] [VERSION]\n' "$0" >&2
     printf 'VERSION must have the form #.#.#. Without it, the newest matching Git tag is used.\n' >&2
+    printf '%s\n' '--development-controls includes staged fairing inspection controls.' >&2
 }
 
 fail() {
@@ -12,16 +13,35 @@ fail() {
     exit 1
 }
 
-if [ "$#" -gt 1 ]; then
-    usage
-    exit 2
-fi
+development_controls=False
+version=
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --development-controls)
+            development_controls=True
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -*)
+            usage
+            exit 2
+            ;;
+        *)
+            [ -z "$version" ] || {
+                usage
+                exit 2
+            }
+            version=$1
+            ;;
+    esac
+    shift
+done
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-if [ "$#" -eq 1 ]; then
-    version=$1
-else
+if [ -z "$version" ]; then
     command -v git >/dev/null 2>&1 || fail "git is required to determine the release version"
     tags=$(git -C "$script_dir" for-each-ref \
         --merged=HEAD \
@@ -93,11 +113,17 @@ replace_line \
     '^ADDON_VERSION = "[^"]*"$' \
     "ADDON_VERSION = \"$version\""
 replace_line \
+    "$temp_dir/src/constants.py" \
+    '^DEVELOPMENT_CONTROLS = .*' \
+    "DEVELOPMENT_CONTROLS = $development_controls"
+replace_line \
     "$temp_dir/src/__init__.py" \
     '^    "version": (.*),$' \
     "    \"version\": ($major, $minor, $patch),"
 
-printf 'Building Holey Tools %s...\n' "$version"
-"$blender" --command extension build \
+printf 'Building Holey Tools %s (development controls: %s)...\n' "$version" "$development_controls"
+# Packaging must not load the user's enabled add-ons (including this extension).
+# Startup options precede --command, which consumes all subsequent arguments.
+"$blender" --factory-startup --command extension build \
     --source-dir "$temp_dir/src" \
     --output-dir "$script_dir"

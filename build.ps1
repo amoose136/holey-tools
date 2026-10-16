@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [string] $Version
+    [string] $Version,
+
+    [switch] $DevelopmentControls
 )
 
 $ErrorActionPreference = 'Stop'
@@ -95,13 +97,20 @@ try {
         -Path (Join-Path $SourceDir 'constants.py') `
         -Pattern '(?m)^ADDON_VERSION = "[^"]*"$' `
         -Replacement "ADDON_VERSION = `"$Version`""
+    $DevelopmentControlsValue = if ($DevelopmentControls) { 'True' } else { 'False' }
+    Set-VersionLine `
+        -Path (Join-Path $SourceDir 'constants.py') `
+        -Pattern '(?m)^DEVELOPMENT_CONTROLS = .*$' `
+        -Replacement "DEVELOPMENT_CONTROLS = $DevelopmentControlsValue"
     Set-VersionLine `
         -Path (Join-Path $SourceDir '__init__.py') `
         -Pattern '(?m)^    "version": \(.*\),$' `
         -Replacement "    `"version`": ($VersionTuple),"
 
-    Write-Host "Building Holey Tools $Version..."
-    & $Blender --command extension build `
+    Write-Host "Building Holey Tools $Version (development controls: $DevelopmentControlsValue)..."
+    # Keep packaging independent of enabled user add-ons and saved preferences.
+    # Startup options precede --command, which consumes subsequent arguments.
+    & $Blender --factory-startup --command extension build `
         --source-dir $SourceDir `
         --output-dir $RepoRoot
     if ($LASTEXITCODE -ne 0) {
