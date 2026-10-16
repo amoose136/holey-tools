@@ -5,12 +5,14 @@ from types import SimpleNamespace
 
 import bmesh
 import bpy
+import numpy as np
 from mathutils import Matrix, Vector
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import src  # noqa: E402
+import src.fair_hole as fair_hole_module  # noqa: E402
 from src.fair_hole import (  # noqa: E402
     MESH_OT_holey_tools_fair_hole,
     _limited_dissolve_analytic_boundary,
@@ -24,22 +26,23 @@ from src.fairing import (  # noqa: E402
     boundary_component,
     choose_hypothesis,
     fair_boundary_loop,
+    finalize_fair_patch,
     fit_sphere_hypothesis,
     limited_dissolve_boundary,
     limited_dissolve_patch,
     ordered_boundary_loop,
     _organic_direction_samples,
     _organic_grid_frame,
-    _organic_grid_layout,
     _plane_intersection,
-    _simplify_organic_boundary,
     _support_planes,
 )
 from src.geometry import GeometryMixin  # noqa: E402
+from src.grid_patcher import prepare_grid_steps  # noqa: E402
 
 
 assert _limited_dissolve_analytic_boundary is shared_analytic_dissolve
 assert _limited_dissolve_cylinder_patch is shared_cylinder_dissolve
+
 
 parallel_reference = Vector((0.0, 0.0, 0.0))
 parallel_plane = {
@@ -466,11 +469,14 @@ axial_coordinates = [
     for vert in cylinder_result["verts"]
 ]
 assert max(axial_coordinates) - min(axial_coordinates) < 1.0e-6
+cylinder_select_mode = (True, False, False)
+bpy.context.tool_settings.mesh_select_mode = cylinder_select_mode
 cylinder_bm, cylinder_cleanup = _limited_dissolve_cylinder_patch(
     cylinder_object,
     cylinder_bm,
     cylinder_result["faces"],
 )
+assert tuple(bpy.context.tool_settings.mesh_select_mode) == cylinder_select_mode
 assert cylinder_cleanup["faces"]
 cylinder_boundaries = []
 cylinder_remaining = {
@@ -624,22 +630,13 @@ assert choose_hypothesis(
     forced_method='ORGANIC',
 )["method"] == "ORGANIC"
 
-# Surface choice and topology choice are independent. A sphere can use the
-# source-aligned grid while every generated point remains on the fitted sphere.
+# Circle remains an explicit analytic option even though Auto now tries Grid.
 sphere_grid_result = fair_boundary_loop(
-    sphere_bm,
-    sphere_loop,
-    sphere_edges,
-    sphere_object.matrix_world,
-    sphere_fit,
-    'GRID',
+    sphere_bm, sphere_loop, sphere_edges, sphere_object.matrix_world, sphere_fit, 'CIRCLE',
 )
-assert sphere_grid_result["fill_style"] == "GRID"
-assert max(
-    abs((sphere_object.matrix_world @ vert.co - sphere_fit["center"]).length
-        - sphere_fit["radius"])
-    for vert in sphere_grid_result["verts"]
-) < 1.0e-5
+assert sphere_grid_result["fill_style"] == "CIRCLE"
+assert max(abs((sphere_object.matrix_world @ vert.co - sphere_fit["center"]).length
+               - sphere_fit["radius"]) for vert in sphere_grid_result["verts"]) < 1.e-5
 
 
 # The final organic path simplifies its boundary at 10 degrees, creates an
@@ -666,6 +663,7 @@ organic_result = fair_boundary_loop(
 )
 assert len(organic_result["boundary_verts"]) <= len(organic_loop)
 assert len(organic_result["verts"]) >= 1
+assert all(len(face.verts) == 4 for face in organic_result["faces"])
 assert_closed_rim(organic_result["boundary_edges"])
 assert all(math.isfinite(component) for vert in organic_result["verts"] for component in vert.co)
 organic_depth_errors = [
@@ -743,9 +741,8 @@ targeted_samples = _organic_direction_samples(
 )
 assert len(targeted_loop) == 8
 assert len(targeted_samples) == 4
-targeted_loop, targeted_edges = _simplify_organic_boundary(
-    targeted_bm, targeted_loop, targeted_edges
-)
+targeted = prepare_grid_steps(targeted_bm, targeted_loop, targeted_edges, Matrix.Identity(4), 'DISSOLVE')
+targeted_loop, targeted_edges = targeted['boundary_verts'], targeted['boundary_edges']
 assert len(targeted_loop) == 4
 assert len(_organic_direction_samples(
     targeted_loop, targeted_edges, Matrix.Identity(4)
@@ -761,61 +758,60 @@ while targeted_remaining:
 assert sorted(len(component) for component in targeted_boundary_components) == [4, 4]
 
 
-# A twelve-vertex annulus receives a 3-by-3 interval budget because the grid
-# perimeter is sized from the boundary count. Clipping those SVD-aligned lines
-# must insert both boundary splits and interior grid intersections.
-leave_edit_mode(targeted_object)
-net_segments = 12
-net_vertices = [
-    (
-        radius * math.cos(math.tau * index / net_segments),
-        radius * math.sin(math.tau * index / net_segments),
-        0.0,
-    )
-    for radius in (2.0, 1.0)
-    for index in range(net_segments)
-]
-net_faces = [
-    (
-        index,
-        (index + 1) % net_segments,
-        net_segments + (index + 1) % net_segments,
-        net_segments + index,
-    )
-    for index in range(net_segments)
-]
-net_object, net_bm = edit_mesh("organic_edge_extension_net", net_vertices, net_faces)
-net_component = min(
-    (
-        boundary_component(edge)
-        for edge in net_bm.edges
-        if len(edge.link_faces) == 1
-    ),
-    key=lambda component: sum(
-        vert.co.length for edge in component for vert in edge.verts
-    ),
-)
-net_loop, net_edges = ordered_boundary_loop(edges=net_component)
-net_layout = _organic_grid_layout(net_loop, net_edges, Matrix.Identity(4))
-assert sum(net_layout["grid_shape"]) == round(len(net_loop) * 0.5)
-assert len(net_layout["input_coords"]) >= len(net_loop)
-assert any(not source for source in net_layout["orig_verts"])
-net_result = fair_boundary_loop(
-    net_bm,
-    net_loop,
-    net_edges,
-    Matrix.Identity(4),
-    {"method": "ORGANIC", "residual": 0.0},
-)
-assert len(net_result["boundary_verts"]) >= len(net_loop)
-assert len(net_result["verts"]) >= 1
-assert_closed_rim(net_result["boundary_edges"])
-
-
 # Exterior edges, rather than the boundary's bounding box, establish grid
 # orientation. Two equally populated orthogonal direction families exercise the
 # otherwise ambiguous equal-singular-value case.
-leave_edit_mode(net_object)
+leave_edit_mode(targeted_object)
+grid_operator_object, grid_operator_bm = grid_mesh(
+    "grid_preparation_operator_redo",
+    [[(x, y, 0.) for x in grid_values] for y in grid_values],
+    {(1, 1), (1, 2), (2, 1), (2, 2)},
+)
+grid_operator_loop, grid_operator_edges = ordered_boundary_loop(
+    edges=inner_boundary_seed(grid_operator_bm)
+)
+protected_seam = grid_operator_edges[0]
+protected_seam.seam = True
+fair_hole_module.DEVELOPMENT_CONTROLS = True
+grid_operator = SimpleNamespace(
+    edge_indices=",".join(str(edge.index) for edge in grid_operator_edges),
+    fairing_method='ORGANIC', fill_style='GRID', final_simplify=False,
+    circle_loops=5, grid_step='DISSOLVE', _object=None,
+    result_method="", result_fill_style="", result_grid_layout="",
+    result_residual=0., report=lambda *_args: None,
+)
+assert MESH_OT_holey_tools_fair_hole.execute(grid_operator, bpy.context) == {'FINISHED'}
+assert grid_operator.result_method == 'GRID_PREP'
+assert grid_operator.result_grid_layout == ''
+assert grid_operator.result_grid_dissolved == 0
+assert protected_seam.is_valid and protected_seam.seam
+assert all(edge.is_valid for edge in grid_operator_edges)
+grid_operator_bm = bmesh.from_edit_mesh(grid_operator_object.data)
+assert all(face.calc_area() > 1.0e-12 for face in grid_operator_bm.faces)
+assert sum(len(edge.link_faces) == 1 for edge in grid_operator_bm.edges) == 24
+grid_operator_face_count = len(grid_operator_bm.faces)
+leave_edit_mode(grid_operator_object)
+
+# Simulate the cumulative second step on the same original input. A regular
+# quad boundary requires no pentagon repairs and remains open, not filled.
+fine_operator_object, fine_operator_bm = grid_mesh(
+    "grid_pentagon_operator_redo",
+    [[(x, y, 0.) for x in grid_values] for y in grid_values],
+    {(1, 1), (1, 2), (2, 1), (2, 2)},
+)
+fine_operator_loop, fine_operator_edges = ordered_boundary_loop(
+    edges=inner_boundary_seed(fine_operator_bm)
+)
+fine_operator = SimpleNamespace(**vars(grid_operator))
+fine_operator.edge_indices = ",".join(str(edge.index) for edge in fine_operator_edges)
+fine_operator.grid_step = 'PENTAGONS'
+assert MESH_OT_holey_tools_fair_hole.execute(fine_operator, bpy.context) == {'FINISHED'}
+assert fine_operator.result_grid_repaired == 0
+fine_operator_bm = bmesh.from_edit_mesh(fine_operator_object.data)
+assert len(fine_operator_bm.faces) == grid_operator_face_count
+assert all(face.calc_area() > 1.0e-12 for face in fine_operator_bm.faces)
+leave_edit_mode(fine_operator_object)
+fair_hole_module.DEVELOPMENT_CONTROLS = False
 alignment_angle = 0.37
 alignment_direction = Vector((
     math.cos(alignment_angle), math.sin(alignment_angle), 0.0

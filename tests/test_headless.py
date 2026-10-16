@@ -22,7 +22,7 @@ for property_name in (
     "fairing_method",
     "fill_style",
     "circle_loops",
-    "grid_angle",
+    "grid_match_curvature",
     "final_simplify",
 ):
     assert property_name in resize_properties, property_name
@@ -53,11 +53,63 @@ assert MESH_OT_holey_tools_resize_hole.modal(
     SimpleNamespace(type='Z'),
 ) == {'PASS_THROUGH'}
 
+# Confirming immediately after fitting is a true no-op. It restores geometry
+# and selection, tears down the modal interaction, and does not create a redo
+# execution. Actual dimension changes continue through normal confirmation.
+modal_cleanup = []
+unchanged_modal = SimpleNamespace(
+    _modal_initial_dimensions={
+        "diameter": 1.0,
+        "depth": 2.0,
+        "truncated_depth": 0.75,
+        "conic_angle": math.radians(60.0),
+    },
+    diameter=1.0,
+    depth=2.0,
+    truncated_depth=0.75,
+    conic_angle=math.radians(60.0),
+    depth_valid=True,
+    angle_valid=True,
+    _restore_original_geometry=lambda: modal_cleanup.append("geometry"),
+    _restore_initial_selection=lambda: modal_cleanup.append("selection"),
+    _finish_modal=lambda _context: modal_cleanup.append("finish"),
+)
+assert not MESH_OT_holey_tools_resize_hole._modal_dimensions_changed(
+    unchanged_modal
+)
+assert MESH_OT_holey_tools_resize_hole._cancel_unchanged_modal(
+    unchanged_modal, modal_context
+)
+assert modal_cleanup == ["geometry", "selection", "finish"]
+unchanged_modal.truncated_depth += 0.001
+assert MESH_OT_holey_tools_resize_hole._modal_dimensions_changed(
+    unchanged_modal
+)
+assert not MESH_OT_holey_tools_resize_hole._cancel_unchanged_modal(
+    unchanged_modal, modal_context
+)
+assert modal_cleanup == ["geometry", "selection", "finish"]
+
+# A conic's hidden diameter is not a fourth dimension and must not trigger a
+# commit when its visible Depth, Truncated Depth and Angle remain unchanged.
+unchanged_modal.truncated_depth = 0.75
+unchanged_modal.diameter = 1.0001
+assert not MESH_OT_holey_tools_resize_hole._modal_dimensions_changed(unchanged_modal)
+unchanged_modal._stage = 'CYLINDER'
+unchanged_modal._drag_active = False
+unchanged_modal._dimension_gizmo_at_event = lambda _event: None
+unchanged_modal._cancel_unchanged_modal = lambda context: MESH_OT_holey_tools_resize_hole._cancel_unchanged_modal(unchanged_modal, context)
+for event_type in ('LEFTMOUSE', 'RET'):
+    assert MESH_OT_holey_tools_resize_hole.modal(
+        unchanged_modal, modal_context,
+        SimpleNamespace(type=event_type, value='PRESS'),
+    ) == {'CANCELLED'}
+
 angle_context = SimpleNamespace(
     scene=SimpleNamespace(holey_tools_flood_angle=math.radians(60.0))
 )
 angle_operator = SimpleNamespace(
-    flood_angle=math.radians(60.0),
+    flood_angle=math.radians(25.0),
     _angle_numeric_input="60.0",
     _angle_numeric_replace=True,
     _show_flood_angle_hud=lambda _context: None,
@@ -106,6 +158,7 @@ diameter_context = SimpleNamespace(
 diameter_operator = SimpleNamespace(
     diameter=0.010,
     depth=0.020,
+    truncated_depth=0.012,
     depth_valid=True,
     conic_angle=math.radians(10.0),
     angle_valid=False,
@@ -113,6 +166,7 @@ diameter_operator = SimpleNamespace(
     _numeric_input="formatted",
     _format_diameter=lambda _context: "formatted",
     _format_depth=lambda _context: "formatted",
+    _format_truncated_depth=lambda _context: "formatted",
     _format_conic_angle=lambda: "10°",
     _format_dimension=lambda _context, _value: "formatted",
     _build_cylinder_preview=lambda _context: None,
@@ -151,6 +205,28 @@ diameter_operator._activate_dimension = lambda context, dimension: (
         diameter_operator, context, dimension
     )
 )
+# Snap-enabled selection clicks and one-pixel jitter must not round the fit or
+# evaluate any geometry before a deliberate drag begins.
+initial_apply = diameter_operator._apply_diameter_to_mesh
+diameter_operator._apply_diameter_to_mesh = lambda _context: (_ for _ in ()).throw(AssertionError("Click jitter evaluated geometry"))
+diameter_context.scene.tool_settings.use_snap = True
+for dimension in ('DIAMETER', 'DEPTH', 'ANGLE'):
+    diameter_operator.angle_valid = True
+    MESH_OT_holey_tools_resize_hole._begin_dimension_drag(
+        diameter_operator, diameter_context,
+        SimpleNamespace(mouse_x=10, mouse_y=20), dimension,
+    )
+    before = diameter_operator._active_dimension_value()
+    for x, y in ((10, 20), (11, 21)):
+        MESH_OT_holey_tools_resize_hole._update_dimension_drag(
+            diameter_operator, diameter_context,
+            SimpleNamespace(mouse_x=x, mouse_y=y, shift=False, ctrl=False),
+        )
+        assert diameter_operator._active_dimension_value() == before
+diameter_operator._apply_diameter_to_mesh = initial_apply
+diameter_context.scene.tool_settings.use_snap = False
+diameter_operator.angle_valid = False
+diameter_operator._active_dimension = 'DIAMETER'
 assert MESH_OT_holey_tools_resize_hole._handle_dimension_step_event(
     diameter_operator,
     diameter_context,
@@ -201,8 +277,23 @@ MESH_OT_holey_tools_resize_hole._update_numeric_preview(
     diameter_operator, diameter_context
 )
 assert abs(diameter_operator.depth - 0.030) < 1.0e-8
+diameter_operator._numeric_input = "0"
+MESH_OT_holey_tools_resize_hole._update_numeric_preview(
+    diameter_operator, diameter_context
+)
+assert diameter_operator.depth == 0.0
+MESH_OT_holey_tools_resize_hole._step_dimension(
+    diameter_operator, diameter_context, -1, False
+)
+assert diameter_operator.depth == 0.0
+diameter_operator._active_dimension = 'DIAMETER'
+diameter_operator._numeric_input = "0"
+MESH_OT_holey_tools_resize_hole._update_numeric_preview(
+    diameter_operator, diameter_context
+)
+assert diameter_operator.diameter == 0.0
 
-# Cone half-angle is a third active dimension. It uses degrees for direct input,
+# Cone included angle is an active dimension. It uses degrees for direct input,
 # one-degree steps, and a horizontal drag whose rightward direction increases it.
 diameter_operator.angle_valid = True
 MESH_OT_holey_tools_resize_hole._activate_dimension(

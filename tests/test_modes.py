@@ -1,7 +1,9 @@
 import math
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import bmesh
 import bpy
@@ -10,10 +12,28 @@ from mathutils import Vector
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.geometry import GeometryMixin  # noqa: E402
 from src.operator import (  # noqa: E402
     MESH_OT_holey_tools_resize_hole,
+    _PersistentPreview,
+    _conic_depth_preserving_bottom,
+    _update_conic_angle,
+    _update_conic_depth,
+    _update_conic_truncated_depth,
     _update_diameter_estimator,
 )
+
+
+def evaluated_vertex_coordinates(obj):
+    """Return object-local coordinates after viewport modifiers."""
+    obj.update_from_editmode()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        return [vertex.co.copy() for vertex in mesh.vertices]
+    finally:
+        evaluated.to_mesh_clear()
 
 
 def create_ring_mesh(name, rings, segments=16):
@@ -53,6 +73,59 @@ def create_ring_mesh(name, rings, segments=16):
     bm = bmesh.from_edit_mesh(mesh)
     bm.faces.ensure_lookup_table()
     bm.verts.ensure_lookup_table()
+    return obj, bm
+
+
+def create_countersunk_through_solid(name, segments=32, cone_rows=1):
+    """Create a closed cylinder with a countersink feeding a through-hole."""
+    rings = (
+        (5.0, 0.0),
+        (2.0, 0.0),
+        *(
+            (2.0 - row / cone_rows, -row / cone_rows)
+            for row in range(1, cone_rows + 1)
+        ),
+        (1.0, -3.0),
+        (5.0, -3.0),
+    )
+    vertices = [
+        (
+            radius * math.cos(math.tau * index / segments),
+            radius * math.sin(math.tau * index / segments),
+            z,
+        )
+        for radius, z in rings
+        for index in range(segments)
+    ]
+    faces = []
+
+    def bridge(first_ring, second_ring, reverse=False):
+        for index in range(segments):
+            following = (index + 1) % segments
+            face = (
+                first_ring + index,
+                first_ring + following,
+                second_ring + following,
+                second_ring + index,
+            )
+            faces.append(tuple(reversed(face)) if reverse else face)
+
+    bridge(0, segments)
+    bridge(0, segments * (cone_rows + 3), reverse=True)
+    bridge(segments * (cone_rows + 3), segments * (cone_rows + 2), reverse=True)
+    for row in range(1, cone_rows + 1):
+        bridge(segments * row, segments * (row + 1))
+    bridge(segments * (cone_rows + 1), segments * (cone_rows + 2))
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(vertices, (), faces)
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.normal_update()
+    bm.faces.ensure_lookup_table()
     return obj, bm
 
 
@@ -896,8 +969,28 @@ assert max(
     for vert in planar_hole_bmesh.verts[:64]
 ) < 1.0e-5
 
-# Finalizing a smaller direct resize selects the inset wall, expands that face
-# region once, and applies the same 0.1-degree limited-dissolve cleanup.
+# Scaling simplification is independently optional and defaults off. A direct
+# shrink without it changes coordinates without growing or replacing selection.
+planar_hole_operator.scaling_final_simplify = False
+planar_hole_operator.diameter = 1.2
+unsimplified_counts = (
+    len(planar_hole_bmesh.verts),
+    len(planar_hole_bmesh.edges),
+    len(planar_hole_bmesh.faces),
+)
+MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
+    planar_hole_operator, bpy.context, commit_boolean=True
+)
+planar_hole_bmesh = bmesh.from_edit_mesh(planar_hole_object.data)
+assert (
+    len(planar_hole_bmesh.verts),
+    len(planar_hole_bmesh.edges),
+    len(planar_hole_bmesh.faces),
+) == unsimplified_counts
+
+# Enabling it selects the inset wall, expands that face region once, and applies
+# the same 0.1-degree Limited Dissolve cleanup used by the prior direct path.
+planar_hole_operator.scaling_final_simplify = True
 planar_hole_operator.diameter = 1.0
 MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
     planar_hole_operator, bpy.context, commit_boolean=True
@@ -987,10 +1080,11 @@ for vert in planar_blind_bmesh.verts[32:64]:
 # The temporary cap and the resulting Boolean top surface stay exactly flat.
 bpy.ops.object.mode_set(mode='OBJECT')
 planar_blind_object.select_set(False)
+square_segments = 32
 square_object, square_bmesh = create_planar_blind_hole(
-    "square_planar_boolean_resize_test", segments=4
+    "triangular_boolean_simplify_test", segments=square_segments
 )
-square_faces = list(square_bmesh.faces[:4])
+square_faces = list(square_bmesh.faces[:square_segments])
 square_operator = SimpleNamespace(
     _object=square_object,
     _locked_indices={face.index for face in square_faces},
@@ -1001,8 +1095,8 @@ square_operator = SimpleNamespace(
     fairing_method='PLANES',
     fill_style='CIRCLE',
     circle_loops=1,
-    grid_angle=0.0,
-    final_simplify=False,
+    final_simplify=True,
+    boolean_segments=3,
 )
 square_operator._world_normal = lambda face: (
     MESH_OT_holey_tools_resize_hole._world_normal(square_operator, face)
@@ -1037,6 +1131,7 @@ MESH_OT_holey_tools_resize_hole._capture_deformation_state(
     square_operator, bpy.context, square_bmesh, square_vertices
 )
 square_operator._resize_dynamic_requires_boolean = True
+square_material_slots = len(square_object.data.materials)
 MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
     square_operator, bpy.context, commit_boolean=True
 )
@@ -1053,6 +1148,21 @@ assert max(
     for face in square_top_faces
     for vert in face.verts
 ) < 1.0e-6
+# A deliberately coarse triangular cutter makes residual fairing topology easy
+# to spot. Split loop normals from the Boolean must not preserve the circle-fill
+# rings/spokes; only the few bridges required to represent a hole may remain.
+square_top_set = set(square_top_faces)
+square_coplanar_edges = {
+    edge
+    for edge in square_bmesh.edges
+    if (
+        len(edge.link_faces) == 2
+        and all(face in square_top_set for face in edge.link_faces)
+        and edge.calc_face_angle(0.0) <= math.radians(0.1)
+    )
+}
+assert len(square_coplanar_edges) <= 6, len(square_coplanar_edges)
+assert len(square_object.data.materials) == square_material_slots
 
 
 # A rim can begin on a true plane but grow beyond that collar onto a sloped
@@ -1100,6 +1210,22 @@ MESH_OT_holey_tools_resize_hole._capture_deformation_state(
     transition_bmesh,
     transition_vertices,
 )
+# The redo override can deliberately retain the direct scaling path even after
+# the enlarged rim leaves its initial planar collar.
+transition_operator.resize_method = 'SCALE'
+MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
+    transition_operator, bpy.context
+)
+assert not transition_operator._resize_requires_boolean
+assert getattr(transition_operator, "_boolean_preview_source", None) is None
+forced_scaling_coordinates = [
+    vert.co.copy()
+    for vert in bmesh.from_edit_mesh(transition_object.data).verts
+]
+
+# Returning to Auto re-evaluates the same target against the support and takes
+# the reconstruction path.
+transition_operator.resize_method = 'AUTO'
 MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
     transition_operator, bpy.context
 )
@@ -1114,14 +1240,16 @@ transition_preview_angles = {
         round(radial.dot(transition_operator._fit["basis_y"])
               / radial.length, 5),
     )
-    for vert in transition_bmesh.verts
-    for offset in (transition_object.matrix_world @ vert.co
+    for coordinate in evaluated_vertex_coordinates(
+        transition_operator._boolean_preview_display_object
+    )
+    for offset in (transition_object.matrix_world @ coordinate
                    - transition_operator._fit["center"],)
     for radial in (offset - transition_operator._fit["axis"]
                    * offset.dot(transition_operator._fit["axis"]),)
     if abs(radial.length - 1.5) < 1.0e-4
 }
-assert len(transition_preview_angles) == 16, transition_preview_angles
+assert len(transition_preview_angles) == 32, transition_preview_angles
 assert transition_operator._boolean_preview_source is not None
 # Once a planar collar has crossed into reconstruction, keep that decision for
 # the rest of the interaction. This prevents tiny pointer/numeric changes near
@@ -1133,6 +1261,42 @@ MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
 assert transition_operator._resize_requires_boolean
 assert transition_operator._resize_dynamic_requires_boolean
 transition_operator.diameter = 3.0
+# A manual Scaling choice must retire the retained Auto Boolean even during
+# the debounce interval. Compare against the original direct-scaling result,
+# including unchanged topology, rather than only checking the mode label.
+transition_operator.resize_method = 'SCALE'
+transition_operator._drag_active = True
+transition_operator._boolean_preview_last_update = time.monotonic()
+MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
+    transition_operator, bpy.context
+)
+assert transition_operator.resize_method == 'SCALE'
+assert not transition_operator._resize_requires_boolean
+assert not transition_operator._resize_dynamic_requires_boolean
+assert transition_operator._boolean_preview_source is None
+assert transition_operator._boolean_reconstruction_source is None
+assert transition_operator._boolean_preview_display_object is None
+assert transition_operator._boolean_preview_cutter_object is None
+assert not transition_operator._boolean_preview_pending
+assert not transition_object.hide_get()
+scaled_vertices = list(bmesh.from_edit_mesh(transition_object.data).verts)
+assert len(scaled_vertices) == len(forced_scaling_coordinates)
+assert all(
+    (vert.co - expected).length < 1.0e-6
+    for vert, expected in zip(scaled_vertices, forced_scaling_coordinates)
+)
+# Repeated forced evaluations stay in Scaling; Auto is reconsidered only when
+# the user explicitly selects it again.
+MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
+    transition_operator, bpy.context, commit_boolean=True
+)
+assert transition_operator.resize_method == 'SCALE'
+assert not transition_operator._resize_requires_boolean
+transition_operator._drag_active = False
+transition_operator.resize_method = 'AUTO'
+MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
+    transition_operator, bpy.context
+)
 MESH_OT_holey_tools_resize_hole._replace_boolean_preview_with_source(
     transition_operator
 )
@@ -1213,8 +1377,8 @@ assert MESH_OT_holey_tools_resize_hole._estimate_angular_segments(
 ) == 12
 
 
-# A real hole whose exterior support is conical gets a low-resolution live
-# Boolean result, then a source-resolution reconstruction at confirmation. Both
+# With Exact Boolean forced on a hole with conical support, its 32 source sides
+# are used live, then a redo segment override is accepted at confirmation. Both
 # remain closed manifolds with the requested 1.5-unit through-hole radius.
 bpy.ops.object.mode_set(mode='OBJECT')
 split_top_object.select_set(False)
@@ -1228,12 +1392,16 @@ boolean_operator = SimpleNamespace(
     scale=1.0,
     diameter=3.0,
     angle_valid=False,
+    resize_method='BOOLEAN',
 )
 boolean_operator._world_normal = lambda face: (
     MESH_OT_holey_tools_resize_hole._world_normal(boolean_operator, face)
 )
 boolean_operator._target_scale = lambda: (
     MESH_OT_holey_tools_resize_hole._target_scale(boolean_operator)
+)
+boolean_operator._target_depth_scale = lambda: (
+    MESH_OT_holey_tools_resize_hole._target_depth_scale(boolean_operator)
 )
 boolean_operator._fit = MESH_OT_holey_tools_resize_hole._fit_cylinder(
     boolean_operator, boolean_faces
@@ -1258,25 +1426,75 @@ boolean_vertices = {vert for face in boolean_faces for vert in face.verts}
 MESH_OT_holey_tools_resize_hole._capture_deformation_state(
     boolean_operator, bpy.context, boolean_bmesh, boolean_vertices
 )
+boolean_source_signature = (
+    MESH_OT_holey_tools_resize_hole._object_topology_signature(boolean_object)
+)
+MESH_OT_holey_tools_resize_hole._build_resize_projection_state(
+    boolean_operator, boolean_bmesh, boolean_faces
+)
+MESH_OT_holey_tools_resize_hole._store_fit_for_redo(boolean_operator)
+boolean_operator.diameter = 3.0
+boolean_redo_source = object.__new__(_PersistentPreview)
+boolean_redo_source._draw_handle = None
+boolean_redo_source._source_object_name = boolean_object.name
+(
+    boolean_redo_source._source_mesh_name,
+    boolean_redo_source._source_mesh,
+    boolean_redo_source._source_bmesh,
+    boolean_redo_source._source_materials,
+) = _PersistentPreview._capture_canonical_source(boolean_operator)
 MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
     boolean_operator, bpy.context
 )
 assert boolean_operator._resize_requires_boolean
 assert boolean_operator._resize_angular_segments == 32
+assert boolean_object.hide_get()
+assert boolean_operator._boolean_preview_display_object is not None
+assert not boolean_operator._boolean_preview_display_object.hide_get()
+assert len(boolean_operator._boolean_preview_display_object.modifiers) == 1
+assert (
+    boolean_object.data.as_pointer()
+    != boolean_operator._boolean_preview_display_object.data.as_pointer()
+)
+assert (
+    MESH_OT_holey_tools_resize_hole._object_topology_signature(boolean_object)
+    == boolean_source_signature
+)
 boolean_bmesh = bmesh.from_edit_mesh(boolean_object.data)
 assert all(len(edge.link_faces) == 2 for edge in boolean_bmesh.edges)
 preview_angles = {
     (
-        round(vert.co.x / math.hypot(vert.co.x, vert.co.y), 5),
-        round(vert.co.y / math.hypot(vert.co.x, vert.co.y), 5),
+        round(coordinate.x / math.hypot(coordinate.x, coordinate.y), 5),
+        round(coordinate.y / math.hypot(coordinate.x, coordinate.y), 5),
     )
-    for vert in boolean_bmesh.verts
-    if abs(math.hypot(vert.co.x, vert.co.y) - 1.5) < 1.0e-4
+    for coordinate in evaluated_vertex_coordinates(
+        boolean_operator._boolean_preview_display_object
+    )
+    if abs(math.hypot(coordinate.x, coordinate.y) - 1.5) < 1.0e-4
 }
-assert len(preview_angles) == 16, preview_angles
+assert len(preview_angles) == 32, preview_angles
+assert boolean_operator._boolean_reconstruction_source is not None
+cached_reconstruction_pointer = (
+    boolean_operator._boolean_reconstruction_source.as_pointer()
+)
+assert MESH_OT_holey_tools_resize_hole._live_boolean_segments(
+    SimpleNamespace(boolean_segments=32, _resize_angular_segments=0)
+) == 32
+assert MESH_OT_holey_tools_resize_hole._live_boolean_segments(
+    SimpleNamespace(boolean_segments=33, _resize_angular_segments=0)
+) == 32
+assert MESH_OT_holey_tools_resize_hole._live_boolean_segments(
+    SimpleNamespace(boolean_segments=12, _resize_angular_segments=0)
+) == 12
 # Pointer moves inside the half-second window retain the previous Boolean mesh.
-# Ending the drag performs one trailing rebuild at the latest requested value.
+# Ending the drag performs one trailing cutter update at the latest value.
 preview_mesh_pointer = boolean_object.data.as_pointer()
+preview_cutter_pointer = (
+    boolean_operator._boolean_preview_cutter_object.as_pointer()
+)
+preview_cutter_mesh_pointer = (
+    boolean_operator._boolean_preview_cutter_object.data.as_pointer()
+)
 boolean_operator._drag_active = True
 boolean_operator._boolean_preview_last_update = 1.0e30
 boolean_operator.diameter = 2.8
@@ -1289,8 +1507,20 @@ boolean_operator._drag_active = False
 MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
     boolean_operator, bpy.context
 )
-assert boolean_object.data.as_pointer() != preview_mesh_pointer
+assert boolean_object.data.as_pointer() == preview_mesh_pointer
+assert (
+    boolean_operator._boolean_preview_cutter_object.as_pointer()
+    == preview_cutter_pointer
+)
+assert (
+    boolean_operator._boolean_preview_cutter_object.data.as_pointer()
+    == preview_cutter_mesh_pointer
+)
 assert not boolean_operator._boolean_preview_pending
+assert (
+    boolean_operator._boolean_reconstruction_source.as_pointer()
+    == cached_reconstruction_pointer
+)
 boolean_operator.diameter = 3.0
 boolean_operator.boolean_segments = 12
 MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
@@ -1314,12 +1544,56 @@ final_angles = {
 }
 assert len(final_angles) == 12, final_angles
 assert boolean_operator._boolean_preview_source is None
+assert boolean_operator._boolean_reconstruction_source is None
+assert not boolean_object.hide_get()
 assert not any(
     obj.name.startswith("Holey Tools Boolean Cutter")
     for obj in bpy.data.objects
 )
+assert not any(
+    obj.name.startswith("Holey Tools Boolean Preview")
+    for obj in bpy.data.objects
+)
+assert not any(
+    modifier.name.startswith("Holey Tools Recreate Hole")
+    for modifier in boolean_object.modifiers
+)
 
-# Shrinking the same non-planar hole also uses reconstruction. The retained
+# Repeat the full redo execution from its canonical source, including a case
+# whose conical exterior Auto now handles directly. Explicit choices persist
+# across mesh replacement, fit restoration, and repeated property changes.
+for requested_method in ('SCALE', 'SCALE', 'BOOLEAN', 'SCALE'):
+    assert boolean_redo_source.restore_source(boolean_object)
+    boolean_operator.resize_method = requested_method
+    if requested_method == 'SCALE':
+        with patch.object(
+            GeometryMixin,
+            "_enlargement_reaches_nonplanar_support",
+            side_effect=AssertionError("Explicit Scaling ran Auto mode selection"),
+        ):
+            result = MESH_OT_holey_tools_resize_hole.execute(
+                boolean_operator, bpy.context
+            )
+    else:
+        result = MESH_OT_holey_tools_resize_hole.execute(
+            boolean_operator, bpy.context
+        )
+    assert result == {'FINISHED'}, (requested_method, result)
+    assert boolean_operator.resize_method == requested_method
+    assert not boolean_operator._resize_base_requires_boolean
+    assert boolean_operator._resize_requires_boolean == (
+        requested_method == 'BOOLEAN'
+    )
+    if requested_method == 'SCALE':
+        assert (
+            MESH_OT_holey_tools_resize_hole._object_topology_signature(
+                boolean_object
+            ) == boolean_source_signature
+        )
+boolean_redo_source.remove()
+
+# Explicit Exact Boolean also reconstructs a shrink of this conic-supported hole.
+# The retained
 # conic patch continues to z = radius - 1 before the smaller cutter is applied.
 bpy.ops.object.mode_set(mode='OBJECT')
 boolean_object.select_set(False)
@@ -1335,6 +1609,8 @@ boolean_shrink_operator = SimpleNamespace(
     scale=1.0,
     diameter=1.0,
     angle_valid=False,
+    final_simplify=True,
+    resize_method='BOOLEAN',
 )
 boolean_shrink_operator._world_normal = lambda face: (
     MESH_OT_holey_tools_resize_hole._world_normal(
@@ -1358,6 +1634,8 @@ boolean_shrink_operator._end_planes = (
     )
 )
 boolean_shrink_operator._depth_fit = None
+shrink_select_mode = (False, True, False)
+bpy.context.tool_settings.mesh_select_mode = shrink_select_mode
 boolean_shrink_vertices = {
     vert for face in boolean_shrink_faces for vert in face.verts
 }
@@ -1367,6 +1645,7 @@ MESH_OT_holey_tools_resize_hole._capture_deformation_state(
     boolean_shrink_bmesh,
     boolean_shrink_vertices,
 )
+shrink_material_slots = len(boolean_shrink_object.data.materials)
 MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
     boolean_shrink_operator, bpy.context, commit_boolean=True
 )
@@ -1378,7 +1657,37 @@ minimum_radius = min(
     for vert in boolean_shrink_bmesh.verts
 )
 assert abs(minimum_radius - 0.5) < 1.0e-4, minimum_radius
-assert any(face.select for face in boolean_shrink_bmesh.faces)
+assert tuple(bpy.context.tool_settings.mesh_select_mode) == shrink_select_mode
+selected_shrink_faces = [
+    face for face in boolean_shrink_bmesh.faces if face.select
+]
+assert selected_shrink_faces
+# Final simplification starts from every surviving fair-surface face, expands
+# exactly once toward the original support, then converts that full region to
+# edge selection. Boolean-generated wall/cap faces must be excluded even if
+# Blender interpolates the temporary fair tag onto them.
+assert any(abs(face.normal.z) > 0.1 for face in selected_shrink_faces)
+assert len(boolean_shrink_object.data.materials) == shrink_material_slots
+# Dissolving the expanded fair region must not bridge the newly cut opening
+# with a polygon whose perimeter is the new rim.
+rogue_fair_caps = []
+for face in boolean_shrink_bmesh.faces:
+    radial_coordinates = [
+        math.hypot(vert.co.x, vert.co.y) for vert in face.verts
+    ]
+    center = face.calc_center_median()
+    if (
+        radial_coordinates
+        and min(radial_coordinates) > 0.49
+        and math.hypot(center.x, center.y) < 0.4
+        and all(
+            abs(vert.co.z - (math.hypot(vert.co.x, vert.co.y) - 1.0))
+            < 1.0e-4
+            for vert in face.verts
+        )
+    ):
+        rogue_fair_caps.append(face)
+assert not rogue_fair_caps
 new_rim = [
     vert for vert in boolean_shrink_bmesh.verts
     if abs(math.hypot(vert.co.x, vert.co.y) - 0.5) < 1.0e-4
@@ -1767,7 +2076,9 @@ assert cube_edge_operator._depth_fit is not None
 assert cube_edge_operator._depth_fit["surface_depth"]
 assert cube_edge_operator.depth_valid
 assert cube_edge_operator.fit_depth_outer_plane == -1
-cube_edge_operator.diameter = 0.6
+# Keep this reconstruction/depth fixture's vertex radius at .3; Diameter now
+# describes the smaller circle which fits between the cutter's flat sides.
+cube_edge_operator.diameter = 0.6 * math.cos(math.pi / cube_edge_operator.boolean_segments)
 cube_edge_operator._target_depth_scale = lambda: (
     MESH_OT_holey_tools_resize_hole._target_depth_scale(cube_edge_operator)
 )
@@ -1839,6 +2150,22 @@ resolved_cube_faces = (
 assert cube_edge_operator._locked_indices != serialized_cube_indices
 assert len(resolved_cube_faces) >= 8
 assert all(face.is_valid for face in resolved_cube_faces)
+
+# Restoring the modal source while switching into Exact Boolean can leave the
+# live operator holding face indices from an intermediate topology. The preview
+# path must rediscover the fitted wall instead of indexing the BMesh blindly.
+cube_edge_operator._locked_indices = {len(cube_edge_bmesh.faces) + 12}
+resolved_out_of_range_faces = (
+    MESH_OT_holey_tools_resize_hole._resolve_resize_wall_faces(
+        cube_edge_operator, cube_edge_bmesh
+    )
+)
+assert len(resolved_out_of_range_faces) >= 8
+assert all(face.is_valid for face in resolved_out_of_range_faces)
+assert all(
+    0 <= index < len(cube_edge_bmesh.faces)
+    for index in cube_edge_operator._locked_indices
+)
 
 signature_a = MESH_OT_holey_tools_resize_hole._canonical_topology_signature(
     4, 5, ((0, 1, 2), (0, 2, 3))
@@ -2095,7 +2422,7 @@ cone_operator = SimpleNamespace(
 cone_operator._world_normal = lambda face: (
     MESH_OT_holey_tools_resize_hole._world_normal(cone_operator, face)
 )
-cone_operator.flood_angle = math.radians(60.0)
+cone_operator.flood_angle = math.radians(25.0)
 cone_flood = MESH_OT_holey_tools_resize_hole._flood_fill(
     cone_operator, cone_faces[0]
 )
@@ -2121,6 +2448,25 @@ cone_operator._depth_fit = MESH_OT_holey_tools_resize_hole._fit_adjustable_depth
 )
 assert cone_operator._depth_fit is not None
 assert abs(cone_operator._depth_fit["initial"] - 4.0) < 1.0e-5
+# Boolean reconstruction can leave a slightly corrugated cone-to-bore seam.
+# Conic depth uses the boundary rings' axial coordinates and must remain
+# adjustable even when a generic planar-end test would reject that seam.
+rough_conic_planes = [dict(plane) for plane in cone_operator._end_planes]
+rough_conic_planes[1]["max_error"] = 0.01
+rough_conic_planes[1]["tolerance"] = 1.0e-6
+rough_conic_depth = MESH_OT_holey_tools_resize_hole._fit_adjustable_depth(
+    cone_operator, rough_conic_planes, cone_operator._fit
+)
+assert rough_conic_depth is not None
+assert abs(rough_conic_depth["initial"] - 4.0) < 1.0e-5
+MESH_OT_holey_tools_resize_hole._store_fit_for_redo(cone_operator)
+assert abs(cone_operator.depth - 8.0) < 1.0e-5
+assert abs(cone_operator.truncated_depth - 4.0) < 1.0e-5
+assert cone_operator.conic_depth_previous == cone_operator.depth
+assert (
+    cone_operator.conic_truncated_depth_previous
+    == cone_operator.truncated_depth
+)
 outer_coordinate = cone_operator._depth_fit["outer_coordinate"]
 assert abs(
     cone_operator._fit["radius"]
@@ -2130,9 +2476,11 @@ assert abs(
 
 cone_operator._fit["radius_coordinate"] = outer_coordinate
 cone_operator.diameter = 4.0
-cone_operator.depth = 4.0
-cone_operator.conic_angle = cone_operator._fit["half_angle"]
+cone_operator.depth = 8.0
+cone_operator.truncated_depth = 4.0
+cone_operator.conic_angle = cone_operator._fit["half_angle"] * 2.0
 cone_operator.angle_valid = True
+cone_operator.depth_valid = True
 cone_operator._target_scale = lambda: (
     MESH_OT_holey_tools_resize_hole._target_scale(cone_operator)
 )
@@ -2145,10 +2493,94 @@ MESH_OT_holey_tools_resize_hole._capture_deformation_state(
     cone_operator, bpy.context, cone_bmesh, cone_vertices
 )
 
-# Increasing depth alone follows the original cone generators. Changing the
-# half-angle afterward pivots the taper about the wider top/model-side circle.
-cone_operator.depth = 5.0
-cone_operator.conic_angle = math.atan(0.1)
+# Editing only the included angle pivots the conic around its physical bottom
+# circle. The truncation plane and radius remain fixed while apex depth changes.
+old_angle = cone_operator.conic_angle
+old_bottom_radius = (
+    cone_operator.depth - cone_operator.truncated_depth
+) * math.tan(old_angle * 0.5)
+new_angle = math.atan(0.5) * 2.0
+preserved_depth = _conic_depth_preserving_bottom(
+    cone_operator.depth,
+    cone_operator.truncated_depth,
+    old_angle,
+    new_angle,
+)
+assert abs(
+    (preserved_depth - cone_operator.truncated_depth)
+    * math.tan(new_angle * 0.5)
+    - old_bottom_radius
+) < 1.0e-9
+angle_update_operator = SimpleNamespace(
+    conic_angle=new_angle,
+    conic_angle_previous=old_angle,
+    depth=cone_operator.depth,
+    truncated_depth=cone_operator.truncated_depth,
+    fit_valid=True,
+    fit_is_cone=True,
+    depth_valid=True,
+    angle_valid=True,
+)
+_update_conic_angle(angle_update_operator, None)
+assert abs(angle_update_operator.depth - preserved_depth) < 1.0e-9
+assert angle_update_operator.conic_angle_previous == new_angle
+
+# Either axial control translates the truncation circle along the cone while
+# preserving its radius. The two depths consequently change by equal amounts.
+dimension_update_operator = SimpleNamespace(
+    depth=8.0,
+    truncated_depth=4.0,
+    conic_depth_previous=8.0,
+    conic_truncated_depth_previous=4.0,
+    fit_valid=True,
+    fit_is_cone=True,
+    depth_valid=True,
+    angle_valid=True,
+)
+dimension_update_operator.depth = 9.5
+_update_conic_depth(dimension_update_operator, None)
+assert abs(dimension_update_operator.truncated_depth - 5.5) < 1.0e-9
+assert abs(
+    dimension_update_operator.depth
+    - dimension_update_operator.truncated_depth
+    - 4.0
+) < 1.0e-9
+dimension_update_operator.truncated_depth = 3.25
+_update_conic_truncated_depth(dimension_update_operator, None)
+assert abs(dimension_update_operator.depth - 7.25) < 1.0e-9
+assert abs(
+    dimension_update_operator.depth
+    - dimension_update_operator.truncated_depth
+    - 4.0
+) < 1.0e-9
+cone_operator.depth = preserved_depth
+cone_operator.conic_angle = new_angle
+MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
+    cone_operator, bpy.context
+)
+cone_bmesh = bmesh.from_edit_mesh(cone_object.data)
+pivot_outer_points = [vert.co for vert in cone_bmesh.verts[:32]]
+pivot_inner_points = [vert.co for vert in cone_bmesh.verts[32:]]
+assert max(abs(point.z - 2.0) for point in pivot_inner_points) < 1.0e-5
+assert max(
+    abs(math.hypot(point.x, point.y) - old_bottom_radius)
+    for point in pivot_inner_points
+) < 1.0e-5
+assert max(abs(point.z + 2.0) for point in pivot_outer_points) < 1.0e-5
+assert max(
+    abs(
+        math.hypot(point.x, point.y)
+        - (old_bottom_radius + 4.0 * math.tan(new_angle * 0.5))
+    )
+    for point in pivot_outer_points
+) < 1.0e-5
+
+# Truncated Depth must remain authoritative when Blender evaluates redo before
+# its update callback has copied the delta into Depth. The fixed small-circle
+# radius is retained while the circle moves one unit farther from the mouth.
+cone_operator.depth = 8.0
+cone_operator.truncated_depth = 5.0
+cone_operator.conic_angle = math.atan(0.25) * 2.0
 MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
     cone_operator, bpy.context
 )
@@ -2156,16 +2588,481 @@ cone_bmesh = bmesh.from_edit_mesh(cone_object.data)
 outer_points = [vert.co for vert in cone_bmesh.verts[:32]]
 inner_points = [vert.co for vert in cone_bmesh.verts[32:]]
 assert max(abs(point.z + 2.0) for point in outer_points) < 1.0e-5
-assert max(abs(math.hypot(point.x, point.y) - 2.0) for point in outer_points) < 1.0e-5
+assert max(abs(math.hypot(point.x, point.y) - 2.25) for point in outer_points) < 1.0e-5
 assert max(abs(point.z - 3.0) for point in inner_points) < 1.0e-5
-assert max(abs(math.hypot(point.x, point.y) - 1.5) for point in inner_points) < 1.0e-5
+assert max(abs(math.hypot(point.x, point.y) - 1.0) for point in inner_points) < 1.0e-5
+
+
+# A countersink can terminate at a circle that continues into a normal bore,
+# with no flat center face. The conic dimensions remain valid, and an Exact
+# Boolean cutter extends that truncation radius through the remaining bore
+# instead of capping it and inventing a blind bottom.
+bpy.ops.object.mode_set(mode='OBJECT')
+cone_object.select_set(False)
+countersink_object, countersink_bmesh = create_ring_mesh(
+    "countersink_with_center_bore_test",
+    ((2.0, -2.0), (1.0, 2.0), (1.0, 5.0)),
+    segments=32,
+)
+bmesh.ops.reverse_faces(
+    countersink_bmesh, faces=list(countersink_bmesh.faces)
+)
+countersink_bmesh.normal_update()
+countersink_faces = list(countersink_bmesh.faces[:32])
+countersink_operator = SimpleNamespace(
+    _object=countersink_object,
+    _locked_indices={face.index for face in countersink_faces},
+    diameter_estimator='AVERAGE',
+    scale=1.0,
+    fit_valid=False,
+    angle_valid=True,
+    depth_valid=True,
+)
+countersink_operator._world_normal = lambda face: (
+    MESH_OT_holey_tools_resize_hole._world_normal(
+        countersink_operator, face
+    )
+)
+countersink_operator._fit = MESH_OT_holey_tools_resize_hole._fit_cylinder(
+    countersink_operator, countersink_faces
+)
+countersink_operator._end_planes = (
+    MESH_OT_holey_tools_resize_hole._fit_boundary_planes(
+        countersink_operator,
+        countersink_faces,
+        countersink_operator._fit["axis"],
+        countersink_operator._fit,
+    )
+)
+countersink_operator._depth_fit = (
+    MESH_OT_holey_tools_resize_hole._fit_adjustable_depth(
+        countersink_operator,
+        countersink_operator._end_planes,
+        countersink_operator._fit,
+    )
+)
+assert countersink_operator._depth_fit is not None
+countersink_operator._fit["radius_coordinate"] = (
+    countersink_operator._depth_fit["outer_coordinate"]
+)
+countersink_operator.depth = 8.0
+countersink_operator.truncated_depth = 4.0
+countersink_operator.conic_angle = math.atan(0.25) * 2.0
+MESH_OT_holey_tools_resize_hole._build_resize_projection_state(
+    countersink_operator, countersink_bmesh, countersink_faces
+)
+countersink_surfaces = {
+    id(surface): surface
+    for surface in countersink_operator._resize_surfaces_by_vertex.values()
+}.values()
+assert any(
+    surface.get("bore_continuation") and not surface["exterior"]
+    for surface in countersink_surfaces
+)
+# Bore classification performs its own coaxial-cylinder test rather than
+# trusting the general fair-surface winner. A locally cylindrical continuation
+# must therefore survive even if that competition happened to report Sphere.
+synthetic_bore_surface = next(
+    surface for surface in countersink_surfaces
+    if surface.get("bore_continuation")
+)
+original_bore_hypothesis = synthetic_bore_surface["hypothesis"]
+synthetic_bore_surface["hypothesis"] = {"method": "SPHERE"}
+assert MESH_OT_holey_tools_resize_hole._is_cylindrical_bore_continuation(
+    countersink_operator, synthetic_bore_surface
+)
+assert synthetic_bore_surface.get("bore_fit") is not None
+synthetic_bore_surface["hypothesis"] = original_bore_hypothesis
+assert set(range(64, 96)).issubset(
+    countersink_operator._resize_bore_vertex_indices
+)
+# This isolated wall fixture has no exterior annulus to identify the model side,
+# so orient its already fitted endpoints by the cone radii as a real countersink
+# support would.
+if MESH_OT_holey_tools_resize_hole._fitted_radius_at(
+    countersink_operator,
+    countersink_operator._depth_fit["outer_coordinate"],
+) < MESH_OT_holey_tools_resize_hole._fitted_radius_at(
+    countersink_operator,
+    countersink_operator._depth_fit["inner_coordinate"],
+):
+    countersink_operator._depth_fit["outer_coordinate"], countersink_operator._depth_fit["inner_coordinate"] = (
+        countersink_operator._depth_fit["inner_coordinate"],
+        countersink_operator._depth_fit["outer_coordinate"],
+    )
+assert MESH_OT_holey_tools_resize_hole._conic_continues_as_cylindrical_bore(
+    countersink_operator
+)
+# Live Boolean preview discards the transient support classifications after it
+# caches the reconstructed base. The latched continuation must still produce a
+# compound three-ring cutter instead of capping the countersink at its small
+# circle on the next drag update.
+cached_countersink_surfaces = countersink_operator._resize_surfaces_by_vertex
+countersink_operator._resize_surfaces_by_vertex = {}
+assert MESH_OT_holey_tools_resize_hole._conic_continues_as_cylindrical_bore(
+    countersink_operator
+)
+cached_vertices, cached_faces = (
+    MESH_OT_holey_tools_resize_hole._boolean_cutter_geometry(
+        countersink_operator,
+        countersink_object,
+        segment_override=8,
+    )
+)
+assert len(cached_vertices) == 24
+assert len(cached_faces) == 18
+countersink_operator._resize_surfaces_by_vertex = cached_countersink_surfaces
+countersink_bottom_radius = (
+    MESH_OT_holey_tools_resize_hole._fitted_radius_at(
+        countersink_operator,
+        countersink_operator._depth_fit["inner_coordinate"],
+    )
+)
+# Geometry retains the fitted continuation-bore radius independently of update
+# callback ordering. Each of the three conic controls can therefore rebuild a
+# cutter without changing the cylindrical through-hole it joins.
+conic_control_values = (
+    (12.0, 4.0, math.atan(0.25) * 2.0),
+    (8.0, 5.0, math.atan(0.25) * 2.0),
+    (8.0, 4.0, math.atan(0.4) * 2.0),
+)
+for depth, truncated_depth, angle in conic_control_values:
+    countersink_operator.depth = depth
+    countersink_operator.truncated_depth = truncated_depth
+    countersink_operator.conic_angle = angle
+    target_inner = (
+        MESH_OT_holey_tools_resize_hole._target_conic_inner_coordinate(
+            countersink_operator
+        )
+    )
+    assert abs(
+        MESH_OT_holey_tools_resize_hole._target_radius_at(
+            countersink_operator, target_inner
+        )
+        - countersink_bottom_radius
+    ) < 1.0e-9
+# Depth is authoritative for Boolean geometry even if a redo callback has not
+# yet copied its delta into Truncated Depth.
+countersink_operator.depth = 8.5
+countersink_operator.truncated_depth = 4.0
+countersink_operator.conic_angle = math.atan(0.25) * 2.0
+depth_only_span = (
+    MESH_OT_holey_tools_resize_hole._target_conic_truncated_depth(
+        countersink_operator
+    )
+)
+assert abs(depth_only_span - 4.5) < 1.0e-5, depth_only_span
+countersink_operator.depth = 8.0
+countersink_operator.truncated_depth = 4.0
+countersink_operator.conic_angle = math.atan(0.25) * 2.0
+countersink_operator.diameter = 4.0
+countersink_operator.resize_method = 'SCALE'
+countersink_operator._target_scale = lambda: (
+    MESH_OT_holey_tools_resize_hole._target_scale(countersink_operator)
+)
+countersink_operator._target_depth_scale = lambda: (
+    MESH_OT_holey_tools_resize_hole._target_depth_scale(
+        countersink_operator
+    )
+)
+countersink_deformation_vertices = {
+    vert for face in countersink_faces for vert in face.verts
+}
+countersink_deformation_vertices.update(
+    countersink_bmesh.verts[index]
+    for index in countersink_operator._resize_bore_vertex_indices
+)
+MESH_OT_holey_tools_resize_hole._capture_deformation_state(
+    countersink_operator,
+    bpy.context,
+    countersink_bmesh,
+    countersink_deformation_vertices,
+)
+countersink_operator.depth = 8.5
+countersink_operator.truncated_depth = 4.5
+MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
+    countersink_operator, bpy.context
+)
+countersink_bmesh = bmesh.from_edit_mesh(countersink_object.data)
+assert max(
+    abs(
+        math.hypot(vert.co.x, vert.co.y)
+        - countersink_bottom_radius
+    )
+    for vert in countersink_bmesh.verts[64:96]
+) < 1.0e-5
+countersink_vertices, countersink_cutter_faces = (
+    MESH_OT_holey_tools_resize_hole._boolean_cutter_geometry(
+        countersink_operator,
+        countersink_object,
+        segment_override=8,
+    )
+)
+assert len(countersink_vertices) == 24
+assert len(countersink_cutter_faces) == 18
+countersink_world = [
+    countersink_object.matrix_world @ point
+    for point in countersink_vertices
+]
+axis = countersink_operator._fit["axis"].normalized()
+outer_coordinate = countersink_operator._depth_fit["outer_coordinate"]
+inner_coordinate = countersink_operator._depth_fit["inner_coordinate"]
+direction = 1.0 if inner_coordinate >= outer_coordinate else -1.0
+cutter_outer_coordinate = sum(
+    (point - countersink_operator._fit["center"]).dot(axis)
+    for point in countersink_world[:8]
+) / 8.0
+# Exact Boolean must not cap the large cone ring coplanar with the reconstructed
+# exterior. Its first ring deliberately extends outside the model.
+assert (
+    (outer_coordinate - cutter_outer_coordinate) * direction
+    > 1.0e-6
+)
+for index in range(8):
+    inner = countersink_world[8 + index] - countersink_operator._fit["center"]
+    end = countersink_world[16 + index] - countersink_operator._fit["center"]
+    inner -= countersink_operator._fit["axis"] * inner.dot(
+        countersink_operator._fit["axis"]
+    )
+    end -= countersink_operator._fit["axis"] * end.dot(
+        countersink_operator._fit["axis"]
+    )
+    assert abs(inner.length - end.length) < 1.0e-6
+    assert inner.length > countersink_bottom_radius
+
+
+# Forced Exact Boolean must use apex Depth itself, not wait for a secondary RNA
+# property to drive its compound cutter. Rebuild a closed countersunk solid,
+# deepen it by 0.5, and verify both the new 2.5-unit mouth and manifold result.
+bpy.ops.object.mode_set(mode='OBJECT')
+countersink_object.select_set(False)
+boolean_countersink_object, boolean_countersink_bmesh = (
+    create_countersunk_through_solid("boolean_countersink_depth_test")
+)
+boolean_countersink_faces = list(boolean_countersink_bmesh.faces[96:128])
+boolean_countersink_operator = SimpleNamespace(
+    _object=boolean_countersink_object,
+    flood_angle=math.radians(20.0),
+    diameter_estimator='AVERAGE',
+    scale=1.0,
+    diameter=0.0,
+    angle_valid=False,
+    depth_valid=False,
+    _depth_fit=None,
+    _locked_indices={face.index for face in boolean_countersink_faces},
+    _resize_projection_ready=False,
+    _resize_dynamic_requires_boolean=False,
+    _original_vertex_coords=None,
+    _proportional_weights=None,
+    _boolean_preview_source=None,
+    _boolean_reconstruction_source=None,
+    resize_method='BOOLEAN',
+    boolean_segments=32,
+    fairing_method='PLANES',
+    fill_style='PLANE',
+    circle_loops=5,
+    grid_match_curvature=True,
+    final_simplify=False,
+    scaling_final_simplify=False,
+    fit_valid=False,
+)
+boolean_countersink_operator._world_normal = lambda face: (
+    MESH_OT_holey_tools_resize_hole._world_normal(
+        boolean_countersink_operator, face
+    )
+)
+boolean_countersink_operator._fit = (
+    MESH_OT_holey_tools_resize_hole._fit_cylinder(
+        boolean_countersink_operator, boolean_countersink_faces
+    )
+)
+boolean_countersink_operator._end_planes = (
+    MESH_OT_holey_tools_resize_hole._fit_boundary_planes(
+        boolean_countersink_operator,
+        boolean_countersink_faces,
+        boolean_countersink_operator._fit["axis"],
+        boolean_countersink_operator._fit,
+    )
+)
+MESH_OT_holey_tools_resize_hole._build_resize_projection_state(
+    boolean_countersink_operator,
+    boolean_countersink_bmesh,
+    boolean_countersink_faces,
+)
+boolean_deformation_vertices = {
+    vert for face in boolean_countersink_faces for vert in face.verts
+}
+boolean_countersink_bmesh.verts.ensure_lookup_table()
+boolean_deformation_vertices.update(
+    boolean_countersink_bmesh.verts[index]
+    for index in boolean_countersink_operator._resize_bore_vertex_indices
+)
+MESH_OT_holey_tools_resize_hole._capture_deformation_state(
+    boolean_countersink_operator,
+    bpy.context,
+    boolean_countersink_bmesh,
+    boolean_deformation_vertices,
+)
+MESH_OT_holey_tools_resize_hole._store_fit_for_redo(
+    boolean_countersink_operator
+)
+boolean_countersink_operator._target_scale = lambda: (
+    MESH_OT_holey_tools_resize_hole._target_scale(
+        boolean_countersink_operator
+    )
+)
+boolean_countersink_operator._target_depth_scale = lambda: (
+    MESH_OT_holey_tools_resize_hole._target_depth_scale(
+        boolean_countersink_operator
+    )
+)
+boolean_countersink_operator.depth += 0.5
+_update_conic_depth(boolean_countersink_operator, None)
+MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
+    boolean_countersink_operator,
+    bpy.context,
+    commit_boolean=True,
+)
+boolean_countersink_bmesh = bmesh.from_edit_mesh(
+    boolean_countersink_object.data
+)
+assert all(edge.is_manifold for edge in boolean_countersink_bmesh.edges)
+boolean_top_radii = [
+    math.hypot(vert.co.x, vert.co.y)
+    for vert in boolean_countersink_bmesh.verts
+    if abs(vert.co.z) < 1.0e-4
+    and math.hypot(vert.co.x, vert.co.y) < 4.0
+]
+assert boolean_top_radii
+assert max(abs(radius - 2.5) for radius in boolean_top_radii) < 1.0e-4
+boolean_bore_radii = [
+    math.hypot(vert.co.x, vert.co.y)
+    for vert in boolean_countersink_bmesh.verts
+    if vert.co.z < -1.1
+    and math.hypot(vert.co.x, vert.co.y) < 2.0
+]
+assert boolean_bore_radii
+boolean_bore_error = max(abs(radius - 1.0) for radius in boolean_bore_radii)
+assert boolean_bore_error < 1.0e-4, (
+    min(boolean_bore_radii), max(boolean_bore_radii), boolean_bore_error
+)
+
+# A fresh invocation on the Boolean result must be able to resize the same
+# conic again. The clearance-wall projection used to collapse solver-split
+# vertices onto identical coordinates without welding them, leaving duplicate
+# boundary edges and a zero-length edge on this second pass.
+boolean_countersink_bmesh.faces.ensure_lookup_table()
+second_countersink_faces = [
+    face
+    for face in boolean_countersink_bmesh.faces
+    if (
+        0.2 < abs(face.normal.z) < 0.95
+        and -2.0 < face.calc_center_median().z < 0.1
+        and math.hypot(
+            face.calc_center_median().x,
+            face.calc_center_median().y,
+        ) < 4.0
+    )
+]
+assert len(second_countersink_faces) == 32
+second_countersink_operator = SimpleNamespace(
+    _object=boolean_countersink_object,
+    flood_angle=math.radians(20.0),
+    diameter_estimator='AVERAGE',
+    scale=1.0,
+    diameter=0.0,
+    angle_valid=False,
+    depth_valid=False,
+    _depth_fit=None,
+    _locked_indices={face.index for face in second_countersink_faces},
+    _resize_projection_ready=False,
+    _resize_dynamic_requires_boolean=False,
+    _original_vertex_coords=None,
+    _proportional_weights=None,
+    _boolean_preview_source=None,
+    _boolean_reconstruction_source=None,
+    resize_method='BOOLEAN',
+    boolean_segments=32,
+    fairing_method='AUTO',
+    fill_style='AUTO',
+    circle_loops=5,
+    grid_match_curvature=True,
+    final_simplify=False,
+    scaling_final_simplify=False,
+    fit_valid=False,
+)
+second_countersink_operator._world_normal = lambda face: (
+    MESH_OT_holey_tools_resize_hole._world_normal(
+        second_countersink_operator, face
+    )
+)
+second_countersink_operator._fit = (
+    MESH_OT_holey_tools_resize_hole._fit_cylinder(
+        second_countersink_operator, second_countersink_faces
+    )
+)
+second_countersink_operator._end_planes = (
+    MESH_OT_holey_tools_resize_hole._fit_boundary_planes(
+        second_countersink_operator,
+        second_countersink_faces,
+        second_countersink_operator._fit["axis"],
+        second_countersink_operator._fit,
+    )
+)
+MESH_OT_holey_tools_resize_hole._build_resize_projection_state(
+    second_countersink_operator,
+    boolean_countersink_bmesh,
+    second_countersink_faces,
+)
+second_deformation_vertices = {
+    vert for face in second_countersink_faces for vert in face.verts
+}
+boolean_countersink_bmesh.verts.ensure_lookup_table()
+second_deformation_vertices.update(
+    boolean_countersink_bmesh.verts[index]
+    for index in second_countersink_operator._resize_bore_vertex_indices
+)
+MESH_OT_holey_tools_resize_hole._capture_deformation_state(
+    second_countersink_operator,
+    bpy.context,
+    boolean_countersink_bmesh,
+    second_deformation_vertices,
+)
+MESH_OT_holey_tools_resize_hole._store_fit_for_redo(
+    second_countersink_operator
+)
+second_countersink_operator._target_scale = lambda: (
+    MESH_OT_holey_tools_resize_hole._target_scale(
+        second_countersink_operator
+    )
+)
+second_countersink_operator._target_depth_scale = lambda: (
+    MESH_OT_holey_tools_resize_hole._target_depth_scale(
+        second_countersink_operator
+    )
+)
+second_countersink_operator.depth += 0.25
+_update_conic_depth(second_countersink_operator, None)
+MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
+    second_countersink_operator,
+    bpy.context,
+    commit_boolean=True,
+)
+boolean_countersink_bmesh = bmesh.from_edit_mesh(
+    boolean_countersink_object.data
+)
+assert all(edge.is_manifold for edge in boolean_countersink_bmesh.edges)
+assert not any(
+    (edge.verts[0].co - edge.verts[1].co).length < 1.0e-8
+    for edge in boolean_countersink_bmesh.edges
+)
 
 
 # Adjust Last Operation can retain a Python wrapper after Blender removes the
 # Object RNA it referenced. Rebinding must not dereference that stale object and
 # must discard every transient mesh/BVH reference before redo reconstruction.
 bpy.ops.object.mode_set(mode='OBJECT')
-cone_object.select_set(False)
+boolean_countersink_object.select_set(False)
 stale_mesh = bpy.data.meshes.new("stale_redo_object_mesh")
 stale_object = bpy.data.objects.new("stale_redo_object", stale_mesh)
 bpy.context.collection.objects.link(stale_object)
@@ -2226,5 +3123,711 @@ assert not redo_binding._resize_projection_ready
 assert not redo_binding._resize_surfaces_by_vertex
 assert redo_binding._resize_base_bvh is None
 assert not redo_binding._resize_base_requires_boolean
+
+# The modal direct-resize path has already moved edit-mesh vertices when the
+# persistent Redo overlay is created. Its retained baseline must normalize those
+# vertices back to the coordinates captured before the preview, and it must be
+# able to put that canonical topology back before a later execution.
+replacement_bmesh = bmesh.from_edit_mesh(replacement_object.data)
+replacement_bmesh.verts.ensure_lookup_table()
+redo_original = replacement_bmesh.verts[0].co.copy()
+replacement_bmesh.verts[0].co += Vector((7.0, -3.0, 2.0))
+bmesh.update_edit_mesh(replacement_object.data, destructive=False)
+redo_source_operator = SimpleNamespace(
+    _object=replacement_object,
+    _original_vertex_coords={0: redo_original},
+)
+(
+    redo_source_name,
+    redo_source_mesh,
+    redo_source_bmesh,
+    redo_source_materials,
+) = _PersistentPreview._capture_canonical_source(redo_source_operator)
+assert (
+    redo_source_mesh.vertices[0].co - redo_original
+).length < 1.0e-9
+redo_source_snapshot = object.__new__(_PersistentPreview)
+redo_source_snapshot._draw_handle = None
+redo_source_snapshot._source_object_name = replacement_object.name
+redo_source_snapshot._source_mesh_name = redo_source_name
+redo_source_snapshot._source_mesh = redo_source_mesh
+redo_source_snapshot._source_bmesh = redo_source_bmesh
+redo_source_snapshot._source_materials = redo_source_materials
+# The real source is hidden while an Exact Boolean display object owns the live
+# preview. Confirmation must still restore it and return it to Edit Mode.
+replacement_object.hide_set(True)
+assert redo_source_snapshot.restore_source(replacement_object)
+assert not replacement_object.hide_get()
+assert replacement_object.mode == 'EDIT'
+replacement_bmesh = bmesh.from_edit_mesh(replacement_object.data)
+replacement_bmesh.verts.ensure_lookup_table()
+assert (
+    replacement_bmesh.verts[0].co - redo_original
+).length < 1.0e-9
+redo_source_snapshot.remove()
+
+
+# Auto keeps a plane/cone/cylinder countersink in Scaling. Exercise every conic
+# control from the same redo source and retain the continuing bore's diameter.
+bpy.ops.object.mode_set(mode='OBJECT')
+replacement_object.select_set(False)
+auto_cone_object, auto_cone_bm = create_countersunk_through_solid(
+    "auto_countersink_scaling", cone_rows=3
+)
+auto_cone_faces = [face for face in auto_cone_bm.faces if 0.2 < abs(face.normal.z) < 0.95]
+
+
+def prepare_auto_resize(obj, bm, faces):
+    op = SimpleNamespace(
+        _object=obj, _locked_indices={face.index for face in faces},
+        diameter_estimator='AVERAGE', resize_method='AUTO', scale=1.0,
+        fit_valid=False, scaling_final_simplify=False,
+    )
+    op._world_normal = lambda face: Resize._world_normal(op, face)
+    op._target_scale = lambda: Resize._target_scale(op)
+    op._target_depth_scale = lambda: Resize._target_depth_scale(op)
+    op._fit = Resize._fit_cylinder(op, faces)
+    op._end_planes = Resize._fit_boundary_planes(op, faces, op._fit["axis"], op._fit)
+    Resize._build_resize_projection_state(op, bm, faces)
+    Resize._capture_deformation_state(op, bpy.context, bm, {vert for face in faces for vert in face.verts})
+    Resize._store_fit_for_redo(op)
+    snapshot = object.__new__(_PersistentPreview)
+    snapshot._draw_handle = None
+    snapshot._source_object_name = obj.name
+    (snapshot._source_mesh_name, snapshot._source_mesh,
+     snapshot._source_bmesh, snapshot._source_materials) = _PersistentPreview._capture_canonical_source(op)
+    return op, snapshot
+
+
+Resize = MESH_OT_holey_tools_resize_hole
+auto_cone_op, auto_cone_source = prepare_auto_resize(auto_cone_object, auto_cone_bm, auto_cone_faces)
+auto_cone_signature = Resize._object_topology_signature(auto_cone_object)
+assert auto_cone_op._conic_bore_continuation
+assert not auto_cone_op._resize_requires_boolean
+
+# Use a registered RNA operator to exercise real conic callbacks and the
+# selection-click lifecycle. Snap and tiny pointer motion must still dismiss
+# without executing or changing a single source vertex or mesh face.
+def check_untouched_cone(untouched_cone, context):
+    untouched_cone._object = auto_cone_object
+    untouched_cone._candidate_indices = {face.index for face in auto_cone_faces}
+    untouched_cone._initial_selection = {face.index for face in auto_cone_bm.faces if face.select}
+    untouched_cone._set_status_text = lambda _context: None
+    untouched_cone._finish_modal = lambda _context: None
+    untouched_cone._dimension_gizmo_at_event = lambda _event: None
+    original_points = [vert.co.copy() for vert in auto_cone_bm.verts]
+    assert untouched_cone._lock_selection_and_fit(context, build_preview=False)
+    assert untouched_cone._active_dimension == 'DEPTH'
+    saved_snap = context.scene.tool_settings.use_snap
+    context.scene.tool_settings.use_snap = True
+    untouched_cone._begin_dimension_drag(
+        context, SimpleNamespace(mouse_x=10, mouse_y=20),
+        untouched_cone._active_dimension,
+    )
+    for x, y in ((10, 20), (11, 21)):
+        untouched_cone._update_dimension_drag(
+            context, SimpleNamespace(mouse_x=x, mouse_y=y, ctrl=False, shift=False)
+        )
+    untouched_cone._drag_active = False
+    assert untouched_cone.modal(
+        SimpleNamespace(area=SimpleNamespace(type='VIEW_3D')),
+        SimpleNamespace(type='LEFTMOUSE', value='PRESS'),
+    ) == {'CANCELLED'}
+    assert Resize._object_topology_signature(auto_cone_object) == auto_cone_signature
+    assert all(vert.co == expected for vert, expected in zip(auto_cone_bm.verts, original_points))
+    # RNA coupling must permit closure, then recover the fitted bottom radius
+    # and physical span when a positive apex depth is entered again.
+    initial_depth = untouched_cone.depth
+    initial_truncated = untouched_cone.truncated_depth
+    untouched_cone.depth = 0.0
+    assert untouched_cone.depth == 0.0
+    assert untouched_cone.truncated_depth == 0.0
+    untouched_cone.depth = initial_depth
+    assert abs(untouched_cone.truncated_depth - initial_truncated) < 1.0e-6
+    initial_angle = untouched_cone.conic_angle
+    initial_diameter = untouched_cone.diameter
+    untouched_cone.diameter = 0.0
+    untouched_cone.conic_angle = 0.0
+    assert not Resize._fair_resize_requested(untouched_cone)
+    untouched_cone.conic_angle = math.radians(60)
+    assert abs(untouched_cone.depth - (
+        untouched_cone.truncated_depth
+        + untouched_cone.fit_conic_bottom_radius / math.tan(math.radians(30))
+    )) < 1.0e-6
+    untouched_cone.conic_angle = initial_angle
+    untouched_cone.diameter = initial_diameter
+    context.scene.tool_settings.use_snap = saved_snap
+    return {'CANCELLED'}
+
+
+with patch.object(Resize, "execute", check_untouched_cone), patch.object(
+    Resize, "poll", classmethod(lambda _cls, _context: True)
+):
+    bpy.utils.register_class(Resize)
+    try:
+        assert bpy.ops.mesh.holey_tools_resize_hole('EXEC_DEFAULT') == {'CANCELLED'}
+    finally:
+        bpy.utils.unregister_class(Resize)
+
+for depth, truncated, angle in (
+    (2.3, 1.3, math.pi / 2.0),
+    (1.6, 0.6, math.pi / 2.0),
+    (1.5, 1.0, 2.0 * math.atan(2.0)),
+):
+    assert auto_cone_source.restore_source(auto_cone_object)
+    auto_cone_op.depth = depth
+    auto_cone_op.truncated_depth = truncated
+    auto_cone_op.conic_angle = angle
+    assert Resize.execute(auto_cone_op, bpy.context) == {'FINISHED'}
+    assert not auto_cone_op._resize_requires_boolean
+    assert Resize._object_topology_signature(auto_cone_object) == auto_cone_signature
+    bm = bmesh.from_edit_mesh(auto_cone_object.data)
+    bm.verts.ensure_lookup_table()
+    assert all(edge.is_manifold for edge in bm.edges)
+    # Shared lower circle follows truncation; the remote bore mouth stays fixed.
+    for vert in bm.verts[128:192]:
+        assert abs(math.hypot(vert.co.x, vert.co.y) - 1.0) < 1.0e-5
+    assert max(abs(vert.co.z + truncated) for vert in bm.verts[128:160]) < 1.0e-5
+    assert max(abs(vert.co.z + 3.0) for vert in bm.verts[160:192]) < 1.0e-5
+auto_cone_source.remove()
+
+# A real triangulated countersink can have a slightly biased fitted axis even
+# though its surrounding top is perfectly planar. Depth translation must not
+# be reapplied after projecting that exterior rim: doing so tilts individual
+# support triangles, and the next invocation mistakes the top for a sphere.
+for dimension, values, callback in (
+    ("depth", (1.7, 1.5), _update_conic_depth),
+    ("truncated_depth", (0.7, 0.5), _update_conic_truncated_depth),
+    ("conic_angle", (math.radians(80), math.radians(70)), _update_conic_angle),
+):
+    bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.context.object.select_set(False)
+    obj, bm = create_countersunk_through_solid(
+        "repeat_imperfect_countersink_" + dimension, cone_rows=3
+    )
+    bm.verts.ensure_lookup_table()
+    bm.verts[64].co.x += 0.002
+    bm.normal_update()
+    cone_faces = [face for face in bm.faces if 0.2 < abs(face.normal.z) < 0.95]
+    bmesh.ops.triangulate(bm, faces=cone_faces)
+    bm.faces.index_update()
+    bm.faces.ensure_lookup_table()
+    bm.normal_update()
+    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+    signature = Resize._object_topology_signature(obj)
+    for value in values:
+        # Deliberately refit the current mesh, as a new invocation does, rather
+        # than restoring a redo snapshot or reusing the previous fit.
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        cone_faces = [face for face in bm.faces if 0.2 < abs(face.normal.z) < 0.95]
+        op, snapshot = prepare_auto_resize(obj, bm, cone_faces)
+        try:
+            assert op._fit["is_cone"] and op._conic_bore_continuation
+            assert not op._resize_requires_boolean, (dimension, value)
+            assert op._fit["axis"].cross(Vector((0, 0, 1))).length > 1.0e-6
+            setattr(op, dimension, value)
+            callback(op, None)
+            assert Resize.execute(op, bpy.context) == {'FINISHED'}
+            assert not op._resize_requires_boolean
+            assert Resize._object_topology_signature(obj) == signature
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.verts.ensure_lookup_table()
+            assert max(abs(vert.co.z) for vert in bm.verts[:64]) < 1.0e-6
+            assert all(edge.is_manifold for edge in bm.edges)
+            assert max(abs(vert.co.z + 3.0) for vert in bm.verts[160:192]) < 1.0e-6
+            assert max(abs(math.hypot(vert.co.x, vert.co.y) - 1.0) for vert in bm.verts[128:192]) < 1.0e-3
+        finally:
+            snapshot.remove()
+
+# Resizing the cylinder instead slides the shared cone circle along the bore
+# axis. Multiple cone rows redistribute on the original generators; their
+# angle and the large mouth stay fixed for both shrinking and enlargement.
+bpy.ops.object.mode_set(mode='OBJECT')
+auto_cone_object.select_set(False)
+auto_bore_object, auto_bore_bm = create_countersunk_through_solid(
+    "auto_bore_with_subdivided_cone", cone_rows=3
+)
+auto_bore_faces = [
+    face for face in auto_bore_bm.faces
+    if abs(face.normal.z) < 0.1 and math.hypot(face.calc_center_median().x, face.calc_center_median().y) < 1.1
+]
+auto_bore_op, auto_bore_source = prepare_auto_resize(auto_bore_object, auto_bore_bm, auto_bore_faces)
+auto_bore_signature = Resize._object_topology_signature(auto_bore_object)
+assert auto_bore_op._resize_conic_surfaces_by_vertex
+assert not auto_bore_op._resize_requires_boolean
+for diameter in (0.8, 2.4, 3.4, 2.0):
+    assert auto_bore_source.restore_source(auto_bore_object)
+    auto_bore_op.diameter = diameter
+    assert Resize.execute(auto_bore_op, bpy.context) == {'FINISHED'}
+    assert not auto_bore_op._resize_requires_boolean
+    assert Resize._object_topology_signature(auto_bore_object) == auto_bore_signature
+    bm = bmesh.from_edit_mesh(auto_bore_object.data)
+    bm.verts.ensure_lookup_table()
+    assert all(edge.is_manifold for edge in bm.edges)
+    assert all(face.calc_area() > 1.0e-8 for face in bm.faces)
+    for vert in bm.verts[32:160]:
+        assert abs(math.hypot(vert.co.x, vert.co.y) - (2.0 + vert.co.z)) < 1.0e-5
+    assert max(abs(vert.co.z) for vert in bm.verts[32:64]) < 1.0e-5
+    for vert in bm.verts[128:192]:
+        assert abs(math.hypot(vert.co.x, vert.co.y) - diameter / 2.0) < 1.0e-5
+    assert max(abs(vert.co.z + 3.0) for vert in bm.verts[160:192]) < 1.0e-5
+auto_bore_source.remove()
+
+# Zero closes the complete cavity, even with Scaling explicitly chosen, and
+# redo can subsequently return to a nonzero size from the unchanged source.
+for fixture in (create_planar_blind_hole, lambda name: create_closed_ring_solid(name, top_outer_z=0.0)):
+    bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.context.active_object.select_set(False)
+    obj, bm = fixture("zero_closes_hole")
+    bm.normal_update()
+    faces = [face for face in bm.faces if abs(face.normal.z) < .1 and math.hypot(face.calc_center_median().x, face.calc_center_median().y) < 1.1]
+    op, source = prepare_auto_resize(obj, bm, faces)
+    op.report = lambda _level, message: (_ for _ in ()).throw(AssertionError(message))
+    for dimension in ('diameter', 'depth') if op.depth_valid else ('diameter',):
+        for mode in ('SCALE', 'BOOLEAN'):
+            assert source.restore_source(obj)
+            op.diameter = op.fit_radius * 2.0
+            op.depth = op.fit_depth_initial
+            setattr(op, dimension, 0.0)
+            op.resize_method = mode
+            assert Resize.execute(op, bpy.context) == {'FINISHED'}
+            closed = bmesh.from_edit_mesh(obj.data)
+            assert all(edge.is_manifold for edge in closed.edges)
+            assert all(face.calc_area() > 1.0e-8 for face in closed.faces)
+            assert not any(abs(face.normal.z) < 0.1 and math.hypot(face.calc_center_median().x, face.calc_center_median().y) < 1.1 for face in closed.faces)
+    # Modal fair-only display is reversible and never substitutes its filled
+    # mesh for the edit-mode source consumed by the next nonzero preview.
+    assert source.restore_source(obj)
+    Resize._reset_execute_transients(op)
+    Resize._restore_fit_for_redo(op)
+    op.diameter = 0.0
+    Resize._apply_diameter_to_mesh(op, bpy.context)
+    assert op._resize_fair_only_preview
+    assert op._boolean_preview_display_object is not None
+    op.diameter = 1.5
+    op.resize_method = 'SCALE'
+    if op.depth_valid:
+        op.depth = op.fit_depth_initial
+    Resize._apply_diameter_to_mesh(op, bpy.context, commit_boolean=True)
+    assert not op._resize_fair_only_preview
+    assert all(edge.is_manifold for edge in bmesh.from_edit_mesh(obj.data).edges)
+    source.remove()
+
+# A bare through-cone has two exterior mouths, not a blind cap or a preexisting
+# bore. Shortening it retains the small exit and inserts a constant-radius bore.
+bpy.ops.object.mode_set(mode='OBJECT')
+bpy.context.active_object.select_set(False)
+segments = 32
+vertices = [
+    (radius * math.cos(math.tau * i / segments), radius * math.sin(math.tau * i / segments), z)
+    for radius, z in ((5.0, 0.0), (2.0, 0.0), (1.0, -2.0), (5.0, -2.0))
+    for i in range(segments)
+]
+faces = []
+for i in range(segments):
+    j = (i + 1) % segments
+    faces.extend(((i, j, segments+j, segments+i),
+                  (segments+i, segments+j, 2*segments+j, 2*segments+i),
+                  (2*segments+i, 2*segments+j, 3*segments+j, 3*segments+i),
+                  (3*segments+i, 3*segments+j, j, i)))
+mesh = bpy.data.meshes.new("through_cone")
+mesh.from_pydata(vertices, [], faces)
+pristine_cone_mesh = mesh.copy()
+obj = bpy.data.objects.new("through_cone", mesh)
+bpy.context.collection.objects.link(obj)
+bpy.context.view_layer.objects.active = obj
+obj.select_set(True)
+bpy.ops.object.mode_set(mode='EDIT')
+bm = bmesh.from_edit_mesh(mesh)
+bm.normal_update()
+bm.faces.ensure_lookup_table()
+cone_faces = [face for face in bm.faces if .1 < abs(face.normal.z) < .95]
+op, source = prepare_auto_resize(obj, bm, cone_faces)
+op.report = lambda _level, message: (_ for _ in ()).throw(AssertionError(message))
+assert op._conic_exit_coordinates is not None
+assert op.depth_valid and op.angle_valid
+for mode in ('AUTO', 'BOOLEAN', 'SCALE'):
+    for truncated in (1.2, .8, 0.0):
+        assert source.restore_source(obj)
+        op.resize_method = mode
+        op.truncated_depth = truncated
+        op.depth = truncated + 2.0
+        assert Resize.execute(op, bpy.context) == {'FINISHED'}
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.normal_update()
+        assert all(edge.is_manifold for edge in bm.edges)
+        assert all(face.calc_area() > 1.0e-8 for face in bm.faces)
+        exit_verts = [vert for vert in bm.verts if abs(vert.co.z + 2.0) < 1.0e-5 and math.hypot(vert.co.x, vert.co.y) < 1.1]
+        assert len(exit_verts) >= 32
+        assert all(abs(math.hypot(vert.co.x, vert.co.y) - 1.0) < 1.0e-5 for vert in exit_verts)
+        cylindrical = [face for face in bm.faces if abs(face.normal.z) < .01 and math.hypot(face.calc_center_median().x, face.calc_center_median().y) < 1.1]
+        assert len(cylindrical) >= 32
+        from mathutils.bvhtree import BVHTree
+        assert BVHTree.FromBMesh(bm).ray_cast(Vector((0, 0, 1)), Vector((0, 0, -1)), 5)[0] is None
+        assert op._resize_requires_boolean == (mode != 'SCALE')
+source.remove()
+
+# Explicit Scaling previews can repeatedly change truncation without stacking
+# connector rings, and returning to the original dimensions restores topology.
+# Capture a fresh source from the pristine fixture, not the previous result.
+bpy.ops.object.mode_set(mode='OBJECT')
+obj.data = pristine_cone_mesh.copy()
+bpy.data.meshes.remove(pristine_cone_mesh)
+bpy.ops.object.mode_set(mode='EDIT')
+bm = bmesh.from_edit_mesh(obj.data)
+bm.normal_update()
+bm.faces.ensure_lookup_table()
+op, source = prepare_auto_resize(obj, bm, [face for face in bm.faces if .1 < abs(face.normal.z) < .95])
+signature = Resize._object_topology_signature(obj)
+op.resize_method = 'SCALE'
+for truncated in (1.2, .8, 1.5):
+    op.truncated_depth = truncated
+    op.depth = truncated + 2.0
+    Resize._apply_diameter_to_mesh(op, bpy.context)
+    assert op._resize_scaled_exit_preview
+    bm = bmesh.from_edit_mesh(obj.data)
+    assert len(bm.verts) == 160
+    assert all(edge.is_manifold for edge in bm.edges)
+op.truncated_depth = op.fit_truncated_depth_initial
+op.depth = op.fit_conic_depth_initial
+Resize._apply_diameter_to_mesh(op, bpy.context, commit_boolean=True)
+assert Resize._object_topology_signature(obj) == signature
+source.remove()
+
+# Closing either part of a countersink removes its entire connected cavity.
+for select_cone in (True, False):
+    bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.context.active_object.select_set(False)
+    obj, bm = create_countersunk_through_solid("close_countersink", cone_rows=3)
+    bm.normal_update()
+    faces = [face for face in bm.faces if (
+        .1 < abs(face.normal.z) < .95 if select_cone else
+        abs(face.normal.z) < .1 and math.hypot(face.calc_center_median().x, face.calc_center_median().y) < 1.1
+    )]
+    op, source = prepare_auto_resize(obj, bm, faces)
+    if select_cone:
+        # Conic controls expose Depth, not the hidden Diameter baseline.
+        op.depth = 0.0
+        _update_conic_depth(op, None)
+    else:
+        op.diameter = 0.0
+    op.report = lambda _level, message: (_ for _ in ()).throw(AssertionError(message))
+    assert Resize.execute(op, bpy.context) == {'FINISHED'}
+    bm = bmesh.from_edit_mesh(obj.data)
+    assert all(edge.is_manifold for edge in bm.edges)
+    assert all(face.calc_area() > 1.0e-8 for face in bm.faces)
+    assert all(abs(face.normal.z) > .95 or math.hypot(face.calc_center_median().x, face.calc_center_median().y) > 4.9 for face in bm.faces)
+    source.remove()
+
+dimension_update_operator.depth = 0.0
+_update_conic_depth(dimension_update_operator, None)
+assert dimension_update_operator.depth == 0.0
+assert dimension_update_operator.truncated_depth == 0.0
+
+# Exact Boolean on a countersink must not re-tessellate its unchanged cylinder.
+# Rotate the source samples off the fit basis and include axial subdivisions:
+# matching only segment count, but not angular phase, used to split every row.
+def bore_polygons(bm):
+    return {
+        tuple(sorted(tuple(round(c, 5) for c in vert.co) for vert in face.verts))
+        for face in bm.faces
+        if abs(face.normal.z) < .01
+        and all(abs(math.hypot(vert.co.x, vert.co.y) - 1.0) < 1.0e-5 for vert in face.verts)
+    }
+
+
+bpy.ops.object.mode_set(mode='OBJECT')
+bpy.context.active_object.select_set(False)
+obj, bm = create_countersunk_through_solid("preserve_boolean_bore", cone_rows=3)
+for vert in bm.verts:
+    x, y = vert.co.x, vert.co.y
+    vert.co.x = x * math.cos(.173) - y * math.sin(.173)
+    vert.co.y = x * math.sin(.173) + y * math.cos(.173)
+longitudinal = [
+    edge for edge in bm.edges
+    if abs(edge.verts[0].co.z - edge.verts[1].co.z) > 1.5
+    and all(abs(math.hypot(v.co.x, v.co.y) - 1.0) < 1.0e-6 for v in edge.verts)
+]
+bmesh.ops.subdivide_edges(bm, edges=longitudinal, cuts=2, use_grid_fill=True)
+bm.normal_update()
+bm.verts.index_update()
+bm.faces.index_update()
+bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+cone_faces = [face for face in bm.faces if .2 < abs(face.normal.z) < .95]
+op, source = prepare_auto_resize(obj, bm, cone_faces)
+op.report = lambda _level, message: (_ for _ in ()).throw(AssertionError(message))
+original_bore = bore_polygons(bm)
+assert len(original_bore) == 96
+
+
+def expected_preserved_bore(join):
+    return {
+        tuple(sorted((x, y, round(join, 5) if abs(z + 1.0) < 1.0e-5 else z)
+                     for x, y, z in polygon))
+        for polygon in original_bore
+    }
+
+
+for method, truncated, angle, simplify in (
+    ('SCALE', 1.2, math.pi / 2, False),
+    ('BOOLEAN', 1.2, math.pi / 2, False),
+    ('BOOLEAN', .6, math.pi / 2, True),
+    ('BOOLEAN', 1.0, math.radians(110), True),
+):
+    assert source.restore_source(obj)
+    op.resize_method = method
+    op.truncated_depth = truncated
+    op.conic_angle = angle
+    op.depth = truncated + 1.0 / math.tan(angle / 2)
+    op.final_simplify = simplify
+    assert Resize.execute(op, bpy.context) == {'FINISHED'}
+    current = bmesh.from_edit_mesh(obj.data)
+    assert all(edge.is_manifold for edge in current.edges)
+    assert all(face.calc_area() > 1.0e-8 for face in current.faces)
+    assert bore_polygons(current) == expected_preserved_bore(-truncated), (method, truncated, len(bore_polygons(current)))
+
+# A changed cutter resolution transitions only at the junction, while every
+# original cylinder face/edge further down the bore remains unchanged.
+for segments in (3, 16, 47):
+    assert source.restore_source(obj)
+    op.resize_method = 'BOOLEAN'
+    op.boolean_segments = segments
+    op.truncated_depth = .8
+    op.conic_angle = math.pi / 2
+    op.depth = 1.8
+    assert Resize.execute(op, bpy.context) == {'FINISHED'}
+    current = bmesh.from_edit_mesh(obj.data)
+    assert all(edge.is_manifold for edge in current.edges), segments
+    assert all(face.calc_area() > 1.0e-8 for face in current.faces), segments
+    assert expected_preserved_bore(-.802) <= bore_polygons(current), (segments, len(bore_polygons(current)))
+
+# Cached live updates move the retained junction as well as the cutter. They
+# must not keep the cylinder frozen at the first preview's truncation depth.
+assert source.restore_source(obj)
+Resize._reset_execute_transients(op)
+assert Resize._restore_fit_for_redo(op)
+op.boolean_segments = 32
+op.truncated_depth = 1.2
+op.depth = 2.2
+Resize._apply_diameter_to_mesh(op, bpy.context)
+assert op._boolean_preserved_bore is not None
+display = op._boolean_preview_display_object
+for truncated, segments in ((.7, 32), (1.4, 16), (1.1, 32)):
+    op.truncated_depth = truncated
+    op.depth = truncated + 1.0
+    op.boolean_segments = segments
+    Resize._apply_diameter_to_mesh(op, bpy.context)
+    assert op._boolean_preview_display_object is display
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated = display.evaluated_get(depsgraph)
+    evaluated_mesh = evaluated.to_mesh()
+    current = bmesh.new()
+    try:
+        current.from_mesh(evaluated_mesh)
+        current.normal_update()
+        assert all(edge.is_manifold for edge in current.edges)
+        join = -truncated - (.002 if segments != 32 else 0.0)
+        assert expected_preserved_bore(join) <= bore_polygons(current), (truncated, segments)
+    finally:
+        current.free()
+        evaluated.to_mesh_clear()
+Resize._replace_boolean_preview_with_source(op, consume=True)
+Resize._discard_boolean_preview_source(op)
+
+# Moving the junction across a source row must use the general reconstruction
+# rather than folding the preserved first strip through that row.
+assert source.restore_source(obj)
+op.truncated_depth = 1.8
+op.depth = 2.8
+op.boolean_segments = 32
+with patch.object(GeometryMixin, "_cap_preserved_boolean_bore", side_effect=AssertionError("Consumed source row must not be preserved")):
+    assert Resize.execute(op, bpy.context) == {'FINISHED'}
+current = bmesh.from_edit_mesh(obj.data)
+assert all(edge.is_manifold for edge in current.edges)
+assert all(face.calc_area() > 1.0e-8 for face in current.faces)
+
+# A fresh invocation after a Boolean must preserve the bore just as redo does.
+assert source.restore_source(obj)
+op.boolean_segments = 32
+op.truncated_depth = 1.2
+op.depth = 2.2
+assert Resize.execute(op, bpy.context) == {'FINISHED'}
+for truncated in (1.4, .9):
+    current = bmesh.from_edit_mesh(obj.data)
+    current.normal_update()
+    cone_faces = [face for face in current.faces if .2 < abs(face.normal.z) < .95]
+    next_op, next_source = prepare_auto_resize(obj, current, cone_faces)
+    next_op.report = op.report
+    next_op.resize_method = 'BOOLEAN'
+    next_op.truncated_depth = truncated
+    next_op.depth = truncated + 1.0
+    assert Resize.execute(next_op, bpy.context) == {'FINISHED'}
+    current = bmesh.from_edit_mesh(obj.data)
+    assert bore_polygons(current) == expected_preserved_bore(-truncated)
+    assert all(edge.is_manifold for edge in current.edges)
+    next_source.remove()
+source.remove()
+assert not [material for material in bpy.data.materials if material.name.startswith("Holey Tools Fair Surface") and material.users == 0]
+
+# The preserved junction is expressed in world-space fit coordinates, while
+# source mesh vertices remain local, including for rotated/scaled objects.
+bpy.ops.object.mode_set(mode='OBJECT')
+obj.select_set(False)
+obj, bm = create_countersunk_through_solid("preserve_bore_transformed")
+from mathutils import Matrix
+obj.matrix_world = Matrix.Translation((3, -4, 2)) @ Matrix.Rotation(.41, 4, 'X') @ Matrix.Scale(1.5, 4)
+cone_faces = list(bm.faces[96:128])
+op, source = prepare_auto_resize(obj, bm, cone_faces)
+op.resize_method = 'BOOLEAN'
+op.truncated_depth = 1.8
+op.depth = 3.3
+op.final_simplify = True
+op.report = lambda _level, message: (_ for _ in ()).throw(AssertionError(message))
+assert Resize.execute(op, bpy.context) == {'FINISHED'}
+current = bmesh.from_edit_mesh(obj.data)
+assert all(edge.is_manifold for edge in current.edges)
+cylinder = bore_polygons(current)
+assert len(cylinder) == 32
+assert {z for polygon in cylinder for _x, _y, z in polygon} == {-3.0, -1.2}
+assert len(obj.data.materials) == 0
+source.remove()
+
+# Zero included angle removes a countersink, not its connected through-hole.
+# Test the visible modal result and redo, including a hidden zero Diameter.
+bpy.ops.object.mode_set(mode='OBJECT')
+bpy.context.object.select_set(False)
+obj, bm = create_countersunk_through_solid("zero_angle_keeps_through_bore", cone_rows=3)
+cone_faces = [face for face in bm.faces if .2 < abs(face.normal.z) < .95]
+op, source = prepare_auto_resize(obj, bm, cone_faces)
+op.report = lambda _level, message: (_ for _ in ()).throw(AssertionError(message))
+from mathutils.bvhtree import BVHTree
+
+
+def check_zero_angle_bore(current):
+    current.normal_update()
+    assert all(edge.is_manifold for edge in current.edges), (
+        method, [(tuple(edge.verts[0].co), tuple(edge.verts[1].co), len(edge.link_faces))
+                 for edge in current.edges if not edge.is_manifold]
+    )
+    assert all(face.calc_area() > 1.0e-8 for face in current.faces)
+    assert BVHTree.FromBMesh(current).ray_cast(Vector((0, 0, 1)), Vector((0, 0, -1)), 5)[0] is None
+    # A ray just outside the original bore must hit the restored top surface.
+    hit = BVHTree.FromBMesh(current).ray_cast(Vector((1.4, 0, 1)), Vector((0, 0, -1)), 5)[0]
+    assert hit is not None and abs(hit.z) < 1.0e-5
+    wall_verts = [vert for vert in current.verts if math.hypot(vert.co.x, vert.co.y) < 1.1]
+    assert len(wall_verts) >= 64
+    assert max(abs(math.hypot(vert.co.x, vert.co.y) - 1.0) for vert in wall_verts) < 1.0e-5
+
+
+for method in ('AUTO', 'SCALE', 'BOOLEAN'):
+    assert source.restore_source(obj)
+    Resize._reset_execute_transients(op)
+    assert Resize._restore_fit_for_redo(op)
+    op.resize_method = method
+    op.diameter = 0.0
+    op.conic_angle = math.radians(60)
+    _update_conic_angle(op, None)
+    Resize._apply_diameter_to_mesh(op, bpy.context)
+    positive_display = getattr(op, "_boolean_preview_display_object", None)
+    operand_points = (
+        [vert.co.copy() for vert in positive_display.data.vertices]
+        if positive_display is not None else None
+    )
+    op.conic_angle = 0.0
+    _update_conic_angle(op, None)
+    assert not Resize._fair_resize_requested(op)
+    Resize._apply_diameter_to_mesh(op, bpy.context)
+    display = getattr(op, "_boolean_preview_display_object", None)
+    if display is None:
+        check_zero_angle_bore(bmesh.from_edit_mesh(obj.data))
+    else:
+        assert display is positive_display
+        assert all(vert.co == point for vert, point in zip(display.data.vertices, operand_points))
+        evaluated = display.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        mesh = evaluated.to_mesh()
+        current = bmesh.new()
+        try:
+            current.from_mesh(mesh)
+            check_zero_angle_bore(current)
+        finally:
+            current.free()
+            evaluated.to_mesh_clear()
+    Resize._replace_boolean_preview_with_source(op, consume=True)
+    Resize._discard_boolean_preview_source(op)
+    assert source.restore_source(obj)
+    assert Resize.execute(op, bpy.context) == {'FINISHED'}
+    check_zero_angle_bore(bmesh.from_edit_mesh(obj.data))
+    # Reopening the same redo operation must recover a real cone and apex.
+    op.conic_angle = math.radians(60)
+    _update_conic_angle(op, None)
+    assert abs(op.depth - (op.truncated_depth + 1.0 / math.tan(math.radians(30)))) < 1.0e-5
+    assert source.restore_source(obj)
+    assert Resize.execute(op, bpy.context) == {'FINISHED'}
+    current = bmesh.from_edit_mesh(obj.data)
+    current.normal_update()
+    assert all(edge.is_manifold for edge in current.edges)
+    assert BVHTree.FromBMesh(current).ray_cast(Vector((0, 0, 1)), Vector((0, 0, -1)), 5)[0] is None
+source.remove()
+
+# Fresh selection after removing a countersink must flood the whole straight
+# bore, not split it at the former cone/bore seam using stale face normals.
+bpy.ops.object.mode_set(mode='OBJECT')
+bpy.context.object.select_set(False)
+obj, bm = create_countersunk_through_solid("resize_after_zero_angle", cone_rows=3)
+cone_faces = list(bm.faces[96:192])
+op, source = prepare_auto_resize(obj, bm, cone_faces)
+op.conic_angle = 0.0
+_update_conic_angle(op, None)
+Resize._apply_diameter_to_mesh(op, bpy.context)
+# Cancellation restores normals as well as coordinates.
+Resize._restore_original_geometry(op)
+bm = bmesh.from_edit_mesh(obj.data)
+bm.faces.ensure_lookup_table()
+assert .2 < abs(bm.faces[96].normal.z) < .95
+Resize._apply_diameter_to_mesh(op, bpy.context)
+assert source.restore_source(obj)
+assert Resize.execute(op, bpy.context) == {'FINISHED'}
+source.remove()
+bm = bmesh.from_edit_mesh(obj.data)
+bm.faces.ensure_lookup_table()
+probe = SimpleNamespace(_object=obj, flood_angle=math.radians(20))
+probe._world_normal = lambda face: Resize._world_normal(probe, face)
+wall = Resize._flood_fill(probe, bm.faces[192])
+assert len(wall) == 128, len(wall)
+assert all(abs(face.normal.z) < 1.0e-5 for face in wall)
+op, source = prepare_auto_resize(obj, bm, wall)
+assert not op._fit["is_cone"] and not op._resize_requires_boolean
+op.diameter = 1.6
+Resize._apply_diameter_to_mesh(op, bpy.context)
+assert source.restore_source(obj)
+assert Resize.execute(op, bpy.context) == {'FINISHED'}
+bm = bmesh.from_edit_mesh(obj.data)
+bm.faces.ensure_lookup_table()
+bm.verts.ensure_lookup_table()
+assert all(abs(bm.faces[i].normal.z) < 1.0e-5 for i in range(96, 224))
+assert max(abs(math.hypot(v.co.x, v.co.y) - .8) for v in bm.verts[32:192]) < 1.0e-5
+assert all(edge.is_manifold for edge in bm.edges)
+source.remove()
+
+# Boolean preview snapshots must also preserve preceding edits which exist
+# only in BMesh, rather than resurrecting the stale mesh datablock coordinates.
+op, source = prepare_auto_resize(obj, bm, list(bm.faces[96:224]))
+op.resize_method = 'BOOLEAN'
+op.diameter = 1.5
+bm.verts[0].co.x += .125
+expected = bm.verts[0].co.copy()
+bm.normal_update()
+bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=False)
+Resize._apply_diameter_to_mesh(op, bpy.context)
+assert op._boolean_preview_source is not None
+assert op._boolean_preview_source.vertices[0].co == expected
+Resize._replace_boolean_preview_with_source(op, consume=True)
+Resize._discard_boolean_preview_source(op)
+bm = bmesh.from_edit_mesh(obj.data)
+bm.verts.ensure_lookup_table()
+assert bm.verts[0].co == expected
+source.remove()
 
 print("HOLEY_TOOLS_MODE_TESTS_OK")
