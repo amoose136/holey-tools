@@ -10,23 +10,27 @@ from bpy_extras import view3d_utils
 from mathutils import Vector
 
 from . import operator as resize_runtime
-from .constants import ADDON_VERSION
+from .constants import ADDON_VERSION, DEVELOPMENT_CONTROLS
 from .fairing import (
     FairingError,
-    _limited_dissolve_analytic_boundary,
-    _limited_dissolve_cylinder_patch,
+    # Compatibility exports used by existing headless clients.
+    _limited_dissolve_analytic_boundary as _limited_dissolve_analytic_boundary,
+    _limited_dissolve_cylinder_patch as _limited_dissolve_cylinder_patch,
     boundary_component,
     choose_hypothesis,
-    fair_boundary_loop,
-    finalize_fair_patch,
     ordered_boundary_loop,
-    prepare_fair_boundary,
 )
+from .fairing_pipeline import fair_hole_patch
 from .geometry import GeometryMixin
 from .gpu_preview import GpuPreviewMixin, _ui_scale
+from .preview_cache import clear_draw_cache
+from .mesh_state import restore_mesh_contents
+from .modal_session import begin_modal_session, end_modal_session
 
 
 _METHOD_LABELS = {
+    'GRID_PREP': "grid boundary preparation",
+    'GRID_ROWS': "refined-edge row patches",
     'PLANES': "N-plane intersection",
     'CONIC': "circular cone/cylinder",
     'SPHERE': "sphere",
@@ -46,24 +50,24 @@ class MESH_OT_holey_tools_fair_hole(
     GpuPreviewMixin,
     bpy.types.Operator,
 ):
-    """Select one non-manifold boundary loop and fill it adaptively."""
+    """Select a boundary for staged quad row fill or analytic fairing."""
 
     bl_idname = "mesh.holey_tools_fair_hole"
     bl_label = "Fair Hole"
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
     bl_description = (
-        "Select a non-manifold edge loop and fill it using plane, conic, "
-        "sphere, or organic curvature fairing"
+        "Select an open boundary for inspectable grid preparation and row fill, "
+        "or choose Auto/Circle for surface fairing"
     )
 
     edge_indices: bpy.props.StringProperty(
         default="", options={'HIDDEN', 'SKIP_SAVE'}
     )
     fairing_method: bpy.props.EnumProperty(
-        name="Surface",
-        description="Surface model used to fair the selected opening",
+        name="Fit",
+        description="Surface fit used to fair the selected opening",
         items=(
-            ('AUTO', "Auto", "Choose the lowest-complexity accepted fit"),
+            ('AUTO', "Auto Fit", "Choose the lowest-complexity accepted fit"),
             ('PLANES', "N-Plane", "Use the adjacent planar regions"),
             (
                 'CYLINDER',
@@ -85,35 +89,83 @@ class MESH_OT_holey_tools_fair_hole(
         options={'SKIP_SAVE'},
     )
     fill_style: bpy.props.EnumProperty(
-        name="Fill",
+        name="Topology",
         description="Topology used inside the selected opening",
         items=(
             (
                 'AUTO',
-                "Auto",
-                "Use the topology associated with the surface fit",
+                "Auto Topology",
+                "Choose topology from the selected fit",
             ),
-            ('GRID', "Grid", "Clip a source-aligned grid to the opening"),
+            ('GRID', "Grid", "Inspect boundary preparation and fill refined quad rows"),
             ('CIRCLE', "Circle", "Use concentric rings and a center fan"),
         ),
         default='AUTO',
         options={'SKIP_SAVE'},
     )
+    grid_step: bpy.props.EnumProperty(
+        name="Stop After",
+        description="Cumulative grid preparation or row-fill stage to inspect",
+        items=(
+            ('DISSOLVE', "1. Dissolve Two-Edge Verts", "Remove boundary vertices with only two connected edges"),
+            ('PENTAGONS', "2. Repair Pentagon Corners", "Also intersect and merge exposed pentagon corners"),
+            ('SLIDE', "3. Slide and Refine T Points", "Align border vertices, then run three T-only refinement passes before triangle completion"),
+            ('REFINE', "4. Refined Edge", "Complete triangle corners and one fixed post-mirror pass"),
+            ('ROWS', "5. Fill Quad Rows", "Fill the refined edge row by row with local count transitions and surface projection"),
+        ),
+        default='ROWS',
+        options={'SKIP_SAVE'},
+    )
+    grid_fill_rows: bpy.props.IntProperty(
+        name="Rows to Fill",
+        description="Stop after this many rows for inspection; zero fills the complete patch",
+        default=0, min=0, max=256, options={'SKIP_SAVE'},
+    )
+    grid_relaxation_iterations: bpy.props.IntProperty(
+        name="Interior Relaxation",
+        description="Relax interior and unpinned refined-rim vertices on the frozen fitted surface; zero disables smoothing",
+        default=20, min=0, max=100, options={'SKIP_SAVE'},
+    )
+    grid_relaxation_strength: bpy.props.FloatProperty(
+        name="Relaxation Strength", description="Fraction of each neighbor-average move, with backtracking to prevent folds",
+        default=.5, min=0., max=1., options={'SKIP_SAVE'},
+    )
+    grid_match_curvature: bpy.props.BoolProperty(
+        name="Match Curvature (C2)",
+        description="Estimate rim slopes and curvature from exterior faces; matching is approximate, with 3D bending fallback for folded height charts",
+        default=True, options={'SKIP_SAVE'},
+    )
+    result_grid_rows_filled: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_rows_total: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_mutations: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_corner_transitions: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_triangles: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_row_method: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_side_counts: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_template_size: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_cuts: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_trimmed_cells: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_relaxation_passes: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_analysis_error: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_surface_continuity: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_refinement_counts: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_t_refinement_counts: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_dissolved: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_merged: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_collapsed_merged: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_repaired: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_skipped: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_slid: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_bowties: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_mirrored: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_notch_caps: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
+    result_grid_step3_skipped: bpy.props.IntProperty(default=0, options={'HIDDEN', 'SKIP_SAVE'})
     circle_loops: bpy.props.IntProperty(
         name="Circle Loops",
         description="Number of concentric quad loops before the center fan",
-        default=2,
+        default=5,
         min=0,
         max=64,
-        options={'SKIP_SAVE'},
-    )
-    grid_angle: bpy.props.FloatProperty(
-        name="Grid Angle Offset",
-        description="Rotate the grid relative to its inferred source alignment",
-        default=0.0,
-        subtype='ANGLE',
-        soft_min=-1.5707963267948966,
-        soft_max=1.5707963267948966,
         options={'SKIP_SAVE'},
     )
     final_simplify: bpy.props.BoolProperty(
@@ -128,15 +180,20 @@ class MESH_OT_holey_tools_fair_hole(
         name="Method", default="", options={'HIDDEN', 'SKIP_SAVE'}
     )
     result_fill_style: bpy.props.StringProperty(
-        name="Fill Result", default="", options={'HIDDEN', 'SKIP_SAVE'}
+        name="Topology Result", default="", options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    result_grid_layout: bpy.props.StringProperty(
+        name="Grid Layout", default="", options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    result_grid_edge_length: bpy.props.FloatProperty(
+        name="Estimated Edge Size", default=0.0,
+        subtype='DISTANCE', unit='LENGTH', options={'HIDDEN', 'SKIP_SAVE'},
     )
     result_residual: bpy.props.FloatProperty(
         name="Fit Residual", default=0.0, options={'HIDDEN', 'SKIP_SAVE'}
     )
 
     _draw_handle = None
-    _fill_batch = None
-    _line_batch = None
     _fill_coords = None
     _line_coords = None
     _draw_error_reported = False
@@ -161,7 +218,7 @@ class MESH_OT_holey_tools_fair_hole(
             and context.area.type == 'VIEW_3D'
         )
 
-    def draw(self, _context):
+    def draw(self, context):
         layout = self.layout
         layout.prop(self, "fairing_method")
         layout.prop(self, "fill_style")
@@ -172,12 +229,59 @@ class MESH_OT_holey_tools_fair_hole(
         )
         if effective_fill == 'CIRCLE':
             layout.prop(self, "circle_loops")
+        elif effective_fill == 'GRID' and not DEVELOPMENT_CONTROLS:
+            if self.result_method not in {'PLANES', 'CONIC', 'SPHERE'}:
+                layout.prop(self, "grid_match_curvature")
         elif effective_fill == 'GRID':
-            layout.prop(self, "grid_angle")
-        layout.prop(self, "final_simplify")
+            layout.prop(self, "grid_step")
+            layout.label(text="Row fill" if self.grid_step == 'ROWS' else "Boundary preparation — hole stays open")
+            layout.label(text=f"Dissolved vertices: {self.result_grid_dissolved}")
+            if self.grid_step in {'PENTAGONS', 'SLIDE', 'REFINE', 'ROWS'}:
+                layout.label(text=f"Ring-face vertices merged (0.001): {self.result_grid_merged}")
+                layout.label(text=f"Collapsed corner edges merged: {self.result_grid_collapsed_merged}")
+                layout.label(text=f"Repaired pentagons: {self.result_grid_repaired}")
+                layout.label(text=f"Skipped pentagons: {self.result_grid_skipped}")
+            if self.grid_step in {'SLIDE', 'REFINE', 'ROWS'}:
+                layout.label(text=f"Slid vertices: {self.result_grid_slid}")
+                layout.label(text=f"Pre-mirror T moves: {self.result_grid_t_refinement_counts}")
+            if self.grid_step in {'REFINE', 'ROWS'}:
+                layout.label(text=f"Repaired bowties: {self.result_grid_bowties}")
+                layout.label(text=f"Completed triangles: {self.result_grid_mirrored}")
+                layout.label(text=f"Single-cell notch caps: {self.result_grid_notch_caps}")
+                layout.label(text=f"Skipped slide/triangle cases: {self.result_grid_step3_skipped}")
+                layout.label(text=f"Post-mirror moves: {self.result_grid_refinement_counts}")
+                layout.label(text=f"U1 / V1 / U2 / V2: {self.result_grid_side_counts or '—'}")
+                layout.label(text=f"Grid template: {self.result_grid_template_size or '—'}")
+                if self.result_grid_analysis_error:
+                    layout.label(text=self.result_grid_analysis_error, icon='ERROR')
+            if self.grid_step == 'ROWS':
+                layout.prop(self, "grid_fill_rows")
+                layout.prop(self, "grid_relaxation_iterations")
+                if self.grid_relaxation_iterations:
+                    layout.prop(self, "grid_relaxation_strength")
+                if self.result_method not in {'PLANES', 'CONIC', 'SPHERE'}:
+                    layout.prop(self, "grid_match_curvature")
+                continuation = {
+                    'ANALYTIC': 'Selected analytic fit',
+                    'C2_ESTIMATED': 'C2 continuation (estimated)',
+                    'INTRINSIC_BENDING': '3D bending continuation (folded chart)',
+                }.get(self.result_grid_surface_continuity, 'Thin plate')
+                layout.label(text=f"Surface: {continuation}")
+                layout.label(text="Layout: Manhattan Grid")
+                layout.label(text=f"Rows filled: {self.result_grid_rows_filled} / {self.result_grid_rows_total}")
+                layout.label(text=f"Mutation patches: {self.result_grid_mutations}")
+                layout.label(text=f"Corner transitions: {self.result_grid_corner_transitions}")
+                layout.label(text=f"Transition triangles: {self.result_grid_triangles}")
+                layout.label(text=f"Required boundary cuts: {self.result_grid_cuts}")
+                layout.label(text=f"Encroached template cells: {self.result_grid_trimmed_cells}")
+        if effective_fill != 'GRID':
+            layout.prop(self, "final_simplify")
+        if self.result_grid_surface_continuity == 'INTRINSIC_BENDING' and (
+                effective_fill != 'GRID' or not DEVELOPMENT_CONTROLS):
+            layout.label(text="Surface: 3D bending continuation (folded chart)")
         layout.separator()
         label = _METHOD_LABELS.get(self.result_method, self.result_method or "—")
-        layout.label(text=f"Result: {label}")
+        layout.label(text=f"Fit: {label}")
         fill_label = _FILL_LABELS.get(
             self.result_fill_style, self.result_fill_style or "—"
         )
@@ -193,8 +297,7 @@ class MESH_OT_holey_tools_fair_hole(
     def _clear_preview(self, context):
         self._fill_coords = None
         self._line_coords = None
-        self._fill_batch = None
-        self._line_batch = None
+        clear_draw_cache(self)
         self._tag_redraw(context)
 
     def _remove_draw_handler(self):
@@ -208,6 +311,7 @@ class MESH_OT_holey_tools_fair_hole(
         self._draw_handle = None
 
     def _finish_modal(self, context):
+        end_modal_session(self)
         self._remove_draw_handler()
         self._clear_preview(context)
         self._object = None
@@ -254,7 +358,7 @@ class MESH_OT_holey_tools_fair_hole(
         best_distance = (14.0 * _ui_scale()) ** 2
         matrix_world = self._object.matrix_world
         for edge in bm.edges:
-            if edge.hide or len(edge.link_faces) != 1:
+            if edge.hide or len(edge.link_faces) != 1 or edge.link_faces[0].hide:
                 continue
             first = view3d_utils.location_3d_to_region_2d(
                 self._region,
@@ -293,8 +397,6 @@ class MESH_OT_holey_tools_fair_hole(
             )
             for edge in ordered_edges
         ]
-        self._fill_batch = None
-        self._line_batch = None
         self._candidate_valid = valid
         self._draw_error_reported = False
         self._set_status_text(context)
@@ -337,7 +439,7 @@ class MESH_OT_holey_tools_fair_hole(
             candidate = f"Invalid boundary component: {count} edges"
         context.workspace.status_text_set(
             f"Holey Tools {ADDON_VERSION}  •  Fair Hole  •  {candidate}  •  "
-            "Click/Enter: fair  •  MMB/Wheel/Trackpad: navigate  •  Esc: cancel"
+            "Click/Enter: apply  •  MMB/Wheel/Trackpad: navigate  •  Esc: cancel"
         )
 
     def _confirm_candidate(self, context):
@@ -361,6 +463,10 @@ class MESH_OT_holey_tools_fair_hole(
         bm.edges.ensure_lookup_table()
         bm.faces.ensure_lookup_table()
         bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=False)
+        # Include current Edit Mode coordinates/topology in the rollback mesh.
+        # A boundary merge can invalidate a tiny opening, so a stale object-mode
+        # snapshot must not discard edits made before invoking this operation.
+        obj.update_from_editmode()
         backup = obj.data.copy()
         try:
             indices = {
@@ -369,62 +475,33 @@ class MESH_OT_holey_tools_fair_hole(
             edges = {bm.edges[index] for index in indices}
             loop_verts, loop_edges = ordered_boundary_loop(edges=edges)
 
-            def fit_hypothesis(forced_method=None):
+            def fit_hypothesis(verts, rim, forced_method=None):
                 return choose_hypothesis(
-                    loop_verts,
-                    loop_edges,
-                    obj.matrix_world,
+                    verts, rim, obj.matrix_world,
                     lambda faces: GeometryMixin._fit_cylinder(self, faces),
                     lambda face: GeometryMixin._world_normal(self, face),
-                    forced_method=(
-                        forced_method
-                        or getattr(self, "fairing_method", 'AUTO')
-                    ),
+                    forced_method=forced_method or getattr(self, "fairing_method", 'AUTO'),
                 )
 
-            hypothesis = fit_hypothesis()
             fill_style = getattr(self, "fill_style", 'AUTO')
-            prepared = prepare_fair_boundary(
-                obj,
-                bm,
-                loop_verts,
-                loop_edges,
-                hypothesis,
-                fill_style,
-            )
-            bm = prepared["bm"]
-            loop_verts = prepared["loop_verts"]
-            loop_edges = prepared["loop_edges"]
-            hypothesis = fit_hypothesis(prepared["forced_method"])
-            result = fair_boundary_loop(
-                bm,
-                loop_verts,
-                loop_edges,
-                obj.matrix_world,
-                hypothesis,
-                fill_style,
-                circle_loops=getattr(self, "circle_loops", 2),
-                grid_angle=getattr(self, "grid_angle", 0.0),
-                direction_samples=prepared["direction_samples"],
-            )
-            loop_verts = result.get("boundary_verts", loop_verts)
-            loop_edges = result.get("boundary_edges", loop_edges)
-            bm, result = finalize_fair_patch(
-                obj,
-                bm,
-                result,
-                loop_verts,
-                loop_edges,
+            hypothesis = fit_hypothesis(loop_verts, loop_edges)
+            bm, result = fair_hole_patch(
+                obj, bm, loop_verts, loop_edges, hypothesis, fill_style,
+                circle_loops=getattr(self, "circle_loops", 5),
                 final_simplify=getattr(self, "final_simplify", True),
+                refit=fit_hypothesis,
+                grid_step=getattr(self, "grid_step", 'ROWS') if DEVELOPMENT_CONTROLS else 'ROWS',
+                fill_rows=getattr(self, "grid_fill_rows", 0) if DEVELOPMENT_CONTROLS else 0,
+                relaxation_iterations=getattr(self, "grid_relaxation_iterations", 20) if DEVELOPMENT_CONTROLS else 20,
+                relaxation_strength=getattr(self, "grid_relaxation_strength", .5) if DEVELOPMENT_CONTROLS else .5,
+                match_curvature=getattr(self, "grid_match_curvature", True),
             )
         except (FairingError, IndexError, RuntimeError, ValueError) as error:
             if obj.mode == 'EDIT':
                 bpy.ops.object.mode_set(mode='OBJECT')
-            failed_mesh = obj.data
-            obj.data = backup
+            restore_mesh_contents(obj, backup)
+            bpy.data.meshes.remove(backup)
             backup = None
-            if failed_mesh.users == 0:
-                bpy.data.meshes.remove(failed_mesh)
             bpy.ops.object.mode_set(mode='EDIT')
             self.report({'WARNING'}, str(error))
             return {'CANCELLED'}
@@ -436,30 +513,88 @@ class MESH_OT_holey_tools_fair_hole(
         for face in bm.faces:
             face.select = False
         for face in result["faces"]:
-            face.select = True
+            face.select_set(True)
         for vert in result["verts"]:
             vert.select = True
-        self.result_method = result["method"]
+        if result["method"] in {'GRID_PREP', 'GRID_ROWS'}:
+            for edge in result["boundary_edges"]:
+                edge.select_set(True)
+        self.result_grid_dissolved = result.get("dissolved", 0)
+        self.result_grid_merged = result.get("merged", 0)
+        self.result_grid_collapsed_merged = result.get("collapsed_merged", 0)
+        self.result_grid_repaired = result.get("repaired", 0)
+        self.result_grid_skipped = result.get("skipped", 0)
+        self.result_grid_slid = result.get("slid", 0)
+        self.result_grid_bowties = result.get("bowties", 0)
+        self.result_grid_mirrored = result.get("mirrored", 0)
+        self.result_grid_notch_caps = result.get("notch_caps", 0)
+        self.result_grid_step3_skipped = result.get("slide_skipped", 0) + result.get("triangle_skipped", 0)
+        self.result_grid_refinement_counts = " / ".join(str(count) for count in result.get("refinement_counts", []))
+        self.result_grid_t_refinement_counts = " / ".join(str(count) for count in result.get("t_refinement_counts", []))
+        self.result_grid_rows_filled = result.get("rows_filled", 0)
+        self.result_grid_rows_total = result.get("rows_total", 0)
+        self.result_grid_mutations = result.get("mutation_patches", 0)
+        self.result_grid_corner_transitions = result.get("corner_transitions", 0)
+        self.result_grid_triangles = result.get("transition_triangles", 0)
+        self.result_grid_row_method = result.get("row_layout_method", "")
+        self.result_grid_side_counts = " / ".join(map(str, result.get("side_counts", ())))
+        self.result_grid_template_size = " × ".join(map(str, result.get("grid_size", ())))
+        self.result_grid_cuts = result.get("grid_cut_count", 0)
+        self.result_grid_trimmed_cells = result.get("grid_trimmed_cells", 0)
+        self.result_grid_relaxation_passes = result.get("relaxation_passes", 0)
+        self.result_grid_analysis_error = result.get("grid_analysis_error", "")
+        self.result_grid_surface_continuity = result.get("surface_continuity", "")
+        self.result_method = result.get("surface_method", result["method"])
         self.result_fill_style = result["fill_style"]
+        self.result_grid_layout = result.get("grid_layout", "")
+        self.result_grid_edge_length = result.get("grid_estimated_edge_length", 0.0)
         self.result_residual = result["residual"]
         bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
         bpy.data.meshes.remove(backup)
         label = _METHOD_LABELS[result["method"]]
-        self.report({'INFO'}, f"Filled hole using {label} fairing")
+        if result["method"] == 'GRID_PREP':
+            step = {'DISSOLVE': 1, 'PENTAGONS': 2, 'SLIDE': 3, 'REFINE': 4}[result['grid_step']]
+            self.report({'INFO'}, (
+                f"Grid step {step}: "
+                f"{result['dissolved']} vertices dissolved, {result['repaired']} pentagons repaired, "
+                f"{result.get('merged', 0)} ring-face vertices merged, "
+                f"{result.get('collapsed_merged', 0)} collapsed corner edges merged, "
+                f"{result.get('slid', 0)} vertices slid, {result.get('bowties', 0)} bowties repaired, "
+                f"{result.get('mirrored', 0)} triangles mirrored, "
+                f"{sum(result.get('t_refinement_counts', []))} pre-mirror T moves, "
+                f"{sum(result.get('refinement_counts', []))} post-mirror refinement moves; hole left open"
+            ))
+        elif result["method"] == 'GRID_ROWS':
+            self.report({'INFO'}, (
+                f"Grid rows: {result['rows_filled']} / {result['rows_total']}, "
+                f"{result['mutation_patches']} local mutation patches, "
+                f"{result['transition_triangles']} transition triangles"
+            ))
+        else:
+            self.report({'INFO'}, f"Filled hole using {label} fairing")
         return {'FINISHED'}
 
-    def modal(self, context, event):
-        if context.area is None or context.area.type != 'VIEW_3D':
+    def cancel(self, context):
+        if getattr(self, '_runtime_cancelled', False):
+            return
+        self._runtime_cancelled = True
+        try:
             self._restore_selection()
+        finally:
             self._finish_modal(context)
+
+    def modal(self, context, event):
+        if getattr(self, '_runtime_cancelled', False):
+            return {'CANCELLED'}
+        if context.area is None or context.area.type != 'VIEW_3D':
+            MESH_OT_holey_tools_fair_hole.cancel(self, context)
             return {'CANCELLED'}
         if resize_runtime._is_view_navigation_event(event.type) or event.type == 'Z':
             return {'PASS_THROUGH'}
         if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
             self._update_hover(context, event)
         elif event.type in {'RIGHTMOUSE', 'ESC'}:
-            self._restore_selection()
-            self._finish_modal(context)
+            MESH_OT_holey_tools_fair_hole.cancel(self, context)
             return {'CANCELLED'}
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             self._update_hover(context, event)
@@ -468,6 +603,13 @@ class MESH_OT_holey_tools_fair_hole(
             return self._confirm_candidate(context)
         return {'RUNNING_MODAL'}
 
+    def _reset_invocation_defaults(self, scene):
+        self.fill_style = scene.holey_tools_fair_fill
+        self.fairing_method = scene.holey_tools_fair_surface
+        self.grid_step = 'ROWS'
+        self.grid_fill_rows = 0
+        self.circle_loops = 5
+
     def invoke(self, context, event):
         if not self.poll(context):
             self.report({'WARNING'}, "Use Fair Hole in Mesh Edit Mode")
@@ -475,6 +617,10 @@ class MESH_OT_holey_tools_fair_hole(
         if resize_runtime._modal_active:
             self.report({'WARNING'}, "Another Holey Tools operation is already active")
             return {'CANCELLED'}
+        # Blender remembers prior redo values even for SKIP_SAVE properties.
+        # Each new interactive invocation takes only the sidebar preselection.
+        self._reset_invocation_defaults(context.scene)
+        self._runtime_cancelled = False
         self._object = context.active_object
         if resize_runtime._persistent_preview is not None:
             resize_runtime._persistent_preview.remove()
@@ -503,10 +649,11 @@ class MESH_OT_holey_tools_fair_hole(
         resize_runtime._modal_active = True
         context.window.cursor_modal_set('CROSSHAIR')
         context.window_manager.modal_handler_add(self)
+        begin_modal_session(self, context)
 
         selected = [
             edge for edge in bm.edges
-            if edge.select and not edge.hide and len(edge.link_faces) == 1
+            if edge.select and not edge.hide and len(edge.link_faces) == 1 and not edge.link_faces[0].hide
         ]
         if selected:
             self._set_candidate(context, selected[0])

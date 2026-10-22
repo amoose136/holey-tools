@@ -3,7 +3,6 @@
 
 import bpy
 
-from .extract_axis import MESH_OT_holey_tools_extract_axis
 from .fair_hole import MESH_OT_holey_tools_fair_hole
 from .operator import MESH_OT_holey_tools_resize_hole, cleanup_runtime
 from .ui import (
@@ -27,7 +26,6 @@ bl_info = {
 _CLASSES = (
     MESH_OT_holey_tools_resize_hole,
     MESH_OT_holey_tools_fair_hole,
-    MESH_OT_holey_tools_extract_axis,
     VIEW3D_PT_holey_tools,
 )
 

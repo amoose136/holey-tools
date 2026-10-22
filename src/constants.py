@@ -6,6 +6,7 @@
 import math
 
 ADDON_VERSION = "0.9.4"
+DEVELOPMENT_CONTROLS = False
 DIAMETER_SYMBOL = "\N{LATIN CAPITAL LETTER O WITH STROKE}"
 FLOOD_ANGLE_HUD_SECONDS = 3.0
 AXIS_FACE_ATTRIBUTE = "holey_axis_region"
@@ -35,6 +36,12 @@ VIEW_NAVIGATION_EVENTS = frozenset({
 # Copied from Blender 5.2's stock settings. This fallback is used if the
 # ThemeView3D.face_retopology property becomes unavailable in a future release.
 FALLBACK_RETOPOLOGY_COLOR = (0.3137, 0.7843, 1.0, 0.0588)
+
+RESIZE_METHOD_ITEMS = (
+    ('AUTO', "Auto", "Choose scaling or Exact Boolean from the fitted support surface"),
+    ('SCALE', "Scaling", "Force direct deformation of the fitted wall"),
+    ('BOOLEAN', "Boolean", "Force reconstruction followed by an Exact Boolean cutter"),
+)
 
 DIAMETER_ESTIMATOR_ITEMS = (
     (

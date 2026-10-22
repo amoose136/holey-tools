@@ -21,6 +21,7 @@ from .constants import (
 )
 from .geometry import GeometryMixin
 from .gpu_preview import GpuPreviewMixin
+from .preview_cache import clear_draw_cache
 
 
 def assign_axis_face_group(obj, face_indices, attribute_name):
@@ -91,7 +92,7 @@ class MESH_OT_holey_tools_extract_axis(
         name="Flood Angle",
         description="Maximum angle between neighboring faces in the hover flood fill",
         subtype='ANGLE',
-        default=math.radians(60.0),
+        default=math.radians(25.0),
         min=math.radians(0.1),
         max=math.radians(89.9),
     )
@@ -105,8 +106,6 @@ class MESH_OT_holey_tools_extract_axis(
     )
 
     _draw_handle = None
-    _fill_batch = None
-    _line_batch = None
     _fill_coords = None
     _line_coords = None
     _draw_error_reported = False
@@ -146,8 +145,7 @@ class MESH_OT_holey_tools_extract_axis(
             context.area.tag_redraw()
 
     def _clear_batches(self, context):
-        self._fill_batch = None
-        self._line_batch = None
+        clear_draw_cache(self)
         self._fill_coords = None
         self._line_coords = None
         self._tag_redraw(context)

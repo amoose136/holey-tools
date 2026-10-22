@@ -7,11 +7,7 @@ import math
 
 import bpy
 
-from .constants import (
-    ADDON_VERSION,
-    AXIS_FACE_ATTRIBUTE,
-    DIAMETER_ESTIMATOR_ITEMS,
-)
+from .constants import DIAMETER_ESTIMATOR_ITEMS, RESIZE_METHOD_ITEMS
 
 
 class VIEW3D_PT_holey_tools(bpy.types.Panel):
@@ -24,14 +20,22 @@ class VIEW3D_PT_holey_tools(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         diameter_estimator = layout.split(factor=0.65, align=True)
-        diameter_estimator.label(text="Diameter Estimate:")
+        diameter_label = diameter_estimator.row()
+        diameter_label.alignment = 'RIGHT'
+        diameter_label.label(text="Diameter Estimate:")
         diameter_estimator.prop(
             context.scene,
             "holey_tools_diameter_estimator",
             text="",
         )
+        resize_mode = layout.split(factor=0.65, align=True)
+        mode_label = resize_mode.row()
+        mode_label.alignment = 'RIGHT'
+        mode_label.label(text="Mode:")
+        resize_mode.prop(context.scene, "holey_tools_resize_method", text="")
         operator = layout.operator("mesh.holey_tools_resize_hole")
         operator.diameter_estimator = context.scene.holey_tools_diameter_estimator
+        operator.resize_method = context.scene.holey_tools_resize_method
         operator.flood_angle = context.scene.holey_tools_flood_angle
         flood_angle_hint = layout.row(align=True)
         flood_angle_hint.alignment = 'LEFT'
@@ -45,30 +49,45 @@ class VIEW3D_PT_holey_tools(bpy.types.Panel):
             )
         )
         layout.label(text="Click wall: apply and adjust")
+        layout.label(text="Ctrl/Cmd-click Resize: use selection")
 
         layout.separator()
-        layout.operator("mesh.holey_tools_fair_hole", icon='MOD_SMOOTH')
+        fair_row = layout.split(factor=0.5, align=True)
+        fair = fair_row.operator("mesh.holey_tools_fair_hole", icon='MOD_SMOOTH')
+        defaults = fair_row.column(align=True)
+        defaults.prop(context.scene, "holey_tools_fair_surface", text="")
+        defaults.prop(context.scene, "holey_tools_fair_fill", text="")
+        fair.fairing_method = context.scene.holey_tools_fair_surface
+        fair.fill_style = context.scene.holey_tools_fair_fill
         layout.label(text="Click boundary: fit and fair")
-
-        layout.separator()
-        layout.label(text="Geometry Nodes", icon='NODETREE')
-        layout.prop(
-            context.scene,
-            "holey_tools_axis_attribute",
-            text="Face Group",
-        )
-        extract = layout.operator("mesh.holey_tools_extract_axis")
-        extract.attribute_name = context.scene.holey_tools_axis_attribute
-        extract.flood_angle = context.scene.holey_tools_flood_angle
-        layout.label(text="Click region: fit cone axis")
 
 
 def register_properties():
+    bpy.types.Scene.holey_tools_resize_method = bpy.props.EnumProperty(
+        name="Resize Mode",
+        description="Mode used by the next Resize Hole invocation",
+        items=RESIZE_METHOD_ITEMS,
+        default='AUTO',
+    )
+    bpy.types.Scene.holey_tools_fair_fill = bpy.props.EnumProperty(
+        name="Fair Topology", description="Topology used by the next Fair Hole invocation",
+        items=(('AUTO', "Auto Topology", "Choose topology from the selected fit"),
+               ('GRID', "Grid Fill", "Require the Manhattan grid patch"),
+               ('CIRCLE', "Circle Fill", "Use concentric rings")), default='AUTO',
+    )
+    bpy.types.Scene.holey_tools_fair_surface = bpy.props.EnumProperty(
+        name="Fair Fit", description="Fit used by the next Fair Hole invocation",
+        items=(('AUTO', "Auto Fit", "Choose an accepted surface fit"),
+               ('PLANES', "N-Plane", "Use adjacent planes"),
+               ('CYLINDER', "Cylinder", "Force a cylinder"),
+               ('SPHERE', "Sphere", "Force a sphere"),
+               ('ORGANIC', "Organic", "Use smooth surface continuation")), default='AUTO',
+    )
     bpy.types.Scene.holey_tools_flood_angle = bpy.props.FloatProperty(
         name="Flood Angle",
         description="Maximum angle between neighboring faces in the hover flood fill",
         subtype='ANGLE',
-        default=math.radians(60.0),
+        default=math.radians(25.0),
         min=math.radians(0.1),
         max=math.radians(89.9),
     )
@@ -78,17 +97,13 @@ def register_properties():
         items=DIAMETER_ESTIMATOR_ITEMS,
         default='AVERAGE',
     )
-    bpy.types.Scene.holey_tools_axis_attribute = bpy.props.StringProperty(
-        name="Axis Face Group",
-        description="Face-domain named attribute used by the Extract Axis node group",
-        default=AXIS_FACE_ATTRIBUTE,
-    )
 
 
 def unregister_properties():
+    for name in ("holey_tools_fair_fill", "holey_tools_fair_surface", "holey_tools_resize_method"):
+        if hasattr(bpy.types.Scene, name):
+            delattr(bpy.types.Scene, name)
     if hasattr(bpy.types.Scene, "holey_tools_flood_angle"):
         del bpy.types.Scene.holey_tools_flood_angle
     if hasattr(bpy.types.Scene, "holey_tools_diameter_estimator"):
         del bpy.types.Scene.holey_tools_diameter_estimator
-    if hasattr(bpy.types.Scene, "holey_tools_axis_attribute"):
-        del bpy.types.Scene.holey_tools_axis_attribute

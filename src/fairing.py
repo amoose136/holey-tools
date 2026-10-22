@@ -10,17 +10,17 @@ import bpy
 import numpy as np
 
 from mathutils import Vector
-from mathutils.geometry import delaunay_2d_cdt
 
 from .constants import PARALLEL_PLANE_ANGLE_EPSILON
+from .visible_geometry import touches_hidden, update_visible_normals
 
 
 RELATIVE_RESIDUAL_TOLERANCE = 0.03
 MAX_SUPPORT_PLANES = 3
-PATCH_RINGS = 2
+PATCH_RINGS = 5
 LIMITED_DISSOLVE_ANGLE = math.radians(0.1)
-ORGANIC_BOUNDARY_DISSOLVE_ANGLE = math.radians(10.0)
 CYLINDER_MERGE_DISTANCE = 0.0001
+COLLAPSED_BOUNDARY_DISTANCE = 1.0e-8
 
 
 class FairingError(ValueError):
@@ -29,7 +29,7 @@ class FairingError(ValueError):
 
 def boundary_component(seed_edge):
     """Flood one connected component of one-face non-manifold edges."""
-    if seed_edge is None or seed_edge.hide or len(seed_edge.link_faces) != 1:
+    if seed_edge is None or seed_edge.hide or len(seed_edge.link_faces) != 1 or seed_edge.link_faces[0].hide:
         return set()
     result = {seed_edge}
     stack = [seed_edge]
@@ -41,6 +41,7 @@ def boundary_component(seed_edge):
                     neighbor not in result
                     and not neighbor.hide
                     and len(neighbor.link_faces) == 1
+                    and not neighbor.link_faces[0].hide
                 ):
                     result.add(neighbor)
                     stack.append(neighbor)
@@ -91,14 +92,74 @@ def ordered_boundary_loop(seed_edge=None, edges=None):
     return ordered_verts, ordered_edges
 
 
+def weld_collapsed_boundary_edges(bm, loop_verts, loop_edges):
+    """Weld only collapsed connected rim edges before angle-based cleanup.
+
+    Coincident vertices are distinct topology: a fan still creates a face for
+    their zero-length edge. Angle tests cannot classify that edge. Do not use
+    a spatial merge, which could weld another nearby opening or source layer.
+    Retain support coordinates, reject pinched links/face loss, and track the
+    surviving loop with live elements rather than indices or nearest points.
+    """
+    loop_verts, loop_edges = list(loop_verts), list(loop_edges)
+    while True:
+        edge = next((edge for edge in loop_edges
+                     if edge.calc_length() <= COLLAPSED_BOUNDARY_DISTANCE), None)
+        if edge is None:
+            break
+        if len(loop_verts) <= 3 or any(vert.hide for vert in edge.verts):
+            raise FairingError("A collapsed boundary edge cannot be welded safely")
+        first, second = edge.verts
+        first_neighbors = {e.other_vert(first) for e in first.link_edges} - {second}
+        second_neighbors = {e.other_vert(second) for e in second.link_edges} - {first}
+        collapsed_faces = {face for face in edge.link_faces
+                           if len(face.verts) == 3 and face.calc_area() <= 1.e-14}
+        # Triangulation can turn a repeated n-gon corner into a zero-area ear.
+        # Its two redundant edges share a neighbor, but one edge belongs only
+        # to that ear. This is removable debris, not a link between valid faces.
+        for neighbor in first_neighbors & second_neighbors:
+            if not any(not (set(bm.edges.get((vert, neighbor)).link_faces) - collapsed_faces)
+                       for vert in (first, second)):
+                raise FairingError("Welding a collapsed boundary edge would pinch the mesh")
+        target = max(edge.verts, key=lambda vert: (len(vert.link_edges), tuple(vert.co)))
+        source = edge.other_vert(target)
+        for face in set(source.link_faces) | set(target.link_faces):
+            old = list(face.verts)
+            changed = list(dict.fromkeys(target if vert is source else vert for vert in old))
+            if len(changed) < 3:
+                if face in collapsed_faces:
+                    continue  # Weld removes only this already-zero-area ear.
+                raise FairingError("Welding a collapsed boundary edge would remove a face")
+            def polygon_normal(vertices):
+                origin = vertices[0].co
+                return sum(((vert.co - origin).cross(vertices[(i + 1) % len(vertices)].co - origin)
+                            for i, vert in enumerate(vertices)), Vector())
+            old_normal, new_normal = polygon_normal(old), polygon_normal(changed)
+            extent = max((vert.co - target.co).length_squared for vert in old)
+            if (new_normal.length <= max(extent * 1.e-12, 1.e-30)
+                    or old_normal.dot(new_normal) <= 0.):
+                raise FairingError("Welding a collapsed boundary edge would fold a face")
+        bmesh.ops.weld_verts(bm, targetmap={source: target})
+        loop_verts.remove(source)
+        loop_edges = [bm.edges.get((vert, loop_verts[(i + 1) % len(loop_verts)]))
+                      for i, vert in enumerate(loop_verts)]
+        if any(edge is None or len(edge.link_faces) != 1 for edge in loop_edges):
+            raise FairingError("Welding a collapsed edge lost the selected boundary")
+    update_visible_normals(bm)
+    return loop_verts, loop_edges
+
+
 def limited_dissolve_boundary(
     bm,
     loop_verts,
     loop_edges,
     angle_limit=LIMITED_DISSOLVE_ANGLE,
     use_all_boundaries=False,
+    *,
+    completed_faces=None,
 ):
-    """Limited-dissolve one boundary ring and return its reordered topology."""
+    """Dissolve a ring; an empty returned loop means it was already closed."""
+    loop_verts, loop_edges = weld_collapsed_boundary_edges(bm, loop_verts, loop_edges)
     original_points = [vert.co.copy() for vert in loop_verts]
     support_faces = {
         face for edge in loop_edges for face in edge.link_faces if face.is_valid
@@ -154,34 +215,54 @@ def limited_dissolve_boundary(
         chosen_indices.pop()
     collinear_verts = [loop_verts[index] for index in chosen_indices]
     if collinear_verts:
-        bmesh.ops.dissolve_verts(
+        operation = bmesh.ops.dissolve_verts(
             bm,
             verts=collinear_verts,
             use_face_split=False,
             use_boundary_tear=False,
         )
-    bm.normal_update()
+        support_faces.update(element for element in (operation or {}).get('region', ())
+                             if isinstance(element, bmesh.types.BMFace))
+    update_visible_normals(bm)
 
-    return _rediscover_boundary(bm, original_points, support_faces)
+    return _rediscover_boundary(
+        bm, original_points, support_faces,
+        original_verts=loop_verts, original_edges=loop_edges,
+        completed_faces=completed_faces,
+    )
 
 
-def _rediscover_boundary(bm, original_points, support_faces):
-    """Find and reorder the boundary component nearest a prior loop."""
+def _rediscover_boundary(
+    bm, original_points, support_faces, *, original_verts, original_edges,
+    completed_faces=None,
+):
+    """Recover only the original opening, never a nearby unrelated boundary."""
 
+    support_faces = {face for face in support_faces if face.is_valid and not face.hide}
+    if not support_faces:
+        support_faces = {face for vert in original_verts if vert.is_valid
+                         for face in vert.link_faces if face.is_valid and not face.hide}
     candidates = {
         edge
         for face in support_faces
-        if face.is_valid
         for edge in face.edges
-        if edge.is_valid and len(edge.link_faces) == 1
+        if edge.is_valid and not edge.hide and len(edge.link_faces) == 1
     }
+    anchors = {vert for vert in original_verts if vert.is_valid}
+    old_edges = {edge for edge in original_edges if edge.is_valid}
+    candidates = {edge for edge in candidates
+                  if edge in old_edges or any(vert in anchors for vert in edge.verts)}
+    if not original_points:
+        raise FairingError("Limited dissolve lost the original boundary scope")
     if not candidates:
-        candidates = {
-            edge for edge in bm.edges
-            if edge.is_valid and not edge.hide and len(edge.link_faces) == 1
-        }
-    if not candidates or not original_points:
-        raise FairingError("Limited dissolve removed the selected boundary")
+        # Boundary-inclusive dissolve can close a planar opening by itself.
+        # Keep the surviving local surface instead of trying another hole or
+        # fitting/projecting a second patch over an already completed repair.
+        if not support_faces or any(face.calc_area() <= 1.e-14 for face in support_faces):
+            raise FairingError("Limited dissolve removed the boundary and its support surface")
+        if completed_faces is not None:
+            completed_faces.extend(support_faces)
+        return [], []
 
     def distance_to_original(edge):
         midpoint = (edge.verts[0].co + edge.verts[1].co) * 0.5
@@ -194,9 +275,10 @@ def _rediscover_boundary(bm, original_points, support_faces):
 
 
 def _limited_dissolve_analytic_boundary(
-    obj, bm, loop_verts, loop_edges
+    obj, bm, loop_verts, loop_edges, *, completed_faces=None,
 ):
     """Run Blender's boundary-inclusive dissolve before an analytic repair."""
+    loop_verts, loop_edges = weld_collapsed_boundary_edges(bm, loop_verts, loop_edges)
     original_points = [vert.co.copy() for vert in loop_verts]
     support_faces = {
         face for edge in loop_edges for face in edge.link_faces if face.is_valid
@@ -232,9 +314,14 @@ def _limited_dissolve_analytic_boundary(
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
-    bm.normal_update()
+    update_visible_normals(bm)
+    # Native dissolve may replace every source support face. Selection tracks
+    # its surviving output, while old element references alone cannot do so.
+    support_faces.update(face for face in bm.faces if face.select and not face.hide)
     loop_verts, loop_edges = _rediscover_boundary(
-        bm, original_points, support_faces
+        bm, original_points, support_faces,
+        original_verts=loop_verts, original_edges=loop_edges,
+        completed_faces=completed_faces,
     )
     return bm, loop_verts, loop_edges
 
@@ -242,7 +329,9 @@ def _limited_dissolve_analytic_boundary(
 def _limited_dissolve_cylinder_patch(obj, bm, patch_faces):
     """Grow a cylinder repair once and run Blender's final limited dissolve."""
     previous_select_mode = tuple(bpy.context.tool_settings.mesh_select_mode)
-    bpy.context.tool_settings.mesh_select_mode = (False, False, True)
+    bpy.ops.mesh.select_mode(
+        use_extend=False, use_expand=False, type='FACE'
+    )
     for vert in bm.verts:
         vert.select = False
     for edge in bm.edges:
@@ -256,6 +345,9 @@ def _limited_dissolve_cylinder_patch(obj, bm, patch_faces):
     bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=False)
     try:
         bpy.ops.mesh.select_more(use_face_step=True)
+        bpy.ops.mesh.select_mode(
+            use_extend=False, use_expand=False, type='EDGE'
+        )
         bpy.ops.mesh.dissolve_limited(
             angle_limit=LIMITED_DISSOLVE_ANGLE,
             use_dissolve_boundaries=False,
@@ -267,7 +359,7 @@ def _limited_dissolve_cylinder_patch(obj, bm, patch_faces):
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
-    bm.normal_update()
+    update_visible_normals(bm)
     faces = [face for face in bm.faces if face.select and face.is_valid]
     verts = list({vert for face in faces for vert in face.verts if vert.is_valid})
     return bm, {"verts": verts, "faces": faces}
@@ -304,7 +396,7 @@ def limited_dissolve_patch(
             if face.is_valid
         }
     if not simplify:
-        bm.normal_update()
+        update_visible_normals(bm)
         faces = list(seed_faces)
         verts = list({
             vert for face in faces for vert in face.verts if vert.is_valid
@@ -319,18 +411,19 @@ def expanded_limited_dissolve(
     angle_limit=LIMITED_DISSOLVE_ANGLE,
 ):
     """Expand a face region by one ring and limited-dissolve that region."""
-    seed_faces = {face for face in seed_faces if face.is_valid}
+    seed_faces = {face for face in seed_faces if face.is_valid and not face.hide}
     expanded_faces = set(seed_faces)
     for face in tuple(seed_faces):
         for edge in face.edges:
             expanded_faces.update(
-                neighbor for neighbor in edge.link_faces if neighbor.is_valid
+                neighbor for neighbor in edge.link_faces if neighbor.is_valid and not neighbor.hide
             )
     affected_verts = {
-        vert for face in expanded_faces for vert in face.verts if vert.is_valid
+        vert for face in expanded_faces for vert in face.verts if vert.is_valid and not touches_hidden(vert)
     }
     affected_edges = {
-        edge for face in expanded_faces for edge in face.edges if edge.is_valid
+        edge for face in expanded_faces for edge in face.edges
+        if edge.is_valid and not edge.hide and not any(linked.hide for linked in edge.link_faces)
     }
     operation = bmesh.ops.dissolve_limit(
         bm,
@@ -340,7 +433,7 @@ def expanded_limited_dissolve(
         edges=list(affected_edges),
         delimit={'NORMAL'},
     )
-    bm.normal_update()
+    update_visible_normals(bm)
 
     faces = {face for face in expanded_faces if face.is_valid}
     faces.update(
@@ -559,6 +652,7 @@ def fit_conic_hypothesis(
         if support_faces is not None
         else {face for edge in loop_edges for face in edge.link_faces}
     )
+    faces = [face for face in faces if not face.hide]
     if len(faces) < 3:
         return None
     try:
@@ -593,6 +687,7 @@ def fit_sphere_hypothesis(
         if support_faces is not None
         else {face for edge in loop_edges for face in edge.link_faces}
     )
+    faces = [face for face in faces if not face.hide]
     if len(faces) < 3:
         return None
     projectors = []
@@ -755,23 +850,6 @@ def _signed_area_2d(points):
     )
 
 
-def _point_in_polygon_2d(point, polygon):
-    inside = False
-    following = polygon[-1]
-    for current in polygon:
-        if (current.y > point.y) != (following.y > point.y):
-            crossing_x = (
-                (following.x - current.x)
-                * (point.y - current.y)
-                / (following.y - current.y)
-                + current.x
-            )
-            if point.x < crossing_x:
-                inside = not inside
-        following = current
-    return inside
-
-
 def _organic_projection_frame(loop_verts, matrix_world):
     """Fit the hole plane and return an oriented 2D projection frame."""
     boundary = _world_points(loop_verts, matrix_world)
@@ -813,7 +891,9 @@ def _organic_direction_samples(loop_verts, loop_edges, matrix_world):
     for vert in loop_verts:
         point = matrix_world @ vert.co
         for edge in vert.link_edges:
-            if edge in boundary_edges or not edge.is_valid:
+            if edge in boundary_edges or not edge.is_valid or edge.hide or (
+                edge.link_faces and all(face.hide for face in edge.link_faces)
+            ):
                 continue
             key = (edge.index, vert.index)
             if key in seen:
@@ -900,341 +980,6 @@ def _organic_grid_frame(
         basis_y.negate()
         boundary = [Vector((point.x, -point.y)) for point in boundary]
     return center, axis, basis_x, basis_y, boundary, singular_values
-
-
-def _grid_line_intersections(boundary, dimension, value, epsilon):
-    """Return deduplicated intersections of one axis-aligned line and polygon."""
-    intersections = []
-    for index, first in enumerate(boundary):
-        second = boundary[(index + 1) % len(boundary)]
-        delta = second[dimension] - first[dimension]
-        if abs(delta) <= epsilon:
-            continue
-        factor = (value - first[dimension]) / delta
-        if factor < -epsilon or factor > 1.0 + epsilon:
-            continue
-        factor = min(1.0, max(0.0, factor))
-        point = first.lerp(second, factor)
-        along = point[1 - dimension]
-        match = next(
-            (
-                item for item in intersections
-                if abs(item[0] - along) <= epsilon
-            ),
-            None,
-        )
-        if match is None:
-            intersections.append((along, index, factor, point))
-    intersections.sort(key=lambda item: item[0])
-    return intersections
-
-
-def _organic_grid_layout(
-    loop_verts,
-    loop_edges,
-    matrix_world,
-    direction_samples=None,
-    grid_angle=0.0,
-):
-    """Build a boundary-sized, SVD-aligned grid clipped to the 2D opening."""
-    center, axis, basis_x, basis_y, boundary, singular_values = (
-        _organic_grid_frame(
-            loop_verts,
-            loop_edges,
-            matrix_world,
-            direction_samples,
-            grid_angle,
-        )
-    )
-    boundary_center = sum(boundary, Vector((0.0, 0.0))) / len(boundary)
-    scale = max(
-        max((point - boundary_center).length for point in boundary),
-        1.0e-6,
-    )
-    epsilon = max(scale * 1.0e-7, 1.0e-9)
-    minimum_x = min(point.x for point in boundary)
-    maximum_x = max(point.x for point in boundary)
-    minimum_y = min(point.y for point in boundary)
-    maximum_y = max(point.y for point in boundary)
-    width = maximum_x - minimum_x
-    height = maximum_y - minimum_y
-    if width <= epsilon or height <= epsilon:
-        raise FairingError("The organic boundary has no stable grid extent")
-
-    # A rectangular grid with x/y interval counts has about 2(x + y) boundary
-    # samples. Allocate that budget by projected aspect ratio, while retaining
-    # at least one interior line in each direction.
-    interval_budget = max(4, round(len(loop_verts) * 0.5))
-    extra_intervals = interval_budget - 4
-    x_extra = round(extra_intervals * width / (width + height))
-    x_intervals = 2 + x_extra
-    y_intervals = 2 + extra_intervals - x_extra
-
-    source_x_levels = []
-    source_y_levels = []
-    direction_samples = direction_samples or _organic_direction_samples(
-        loop_verts, loop_edges, matrix_world
-    )
-    for source_point, source_direction in direction_samples:
-        direction = source_direction - axis * source_direction.dot(axis)
-        projected = Vector((
-            direction.dot(basis_x), direction.dot(basis_y)
-        ))
-        if projected.length_squared <= 1.0e-16:
-            continue
-        coordinate = Vector((
-            (source_point - center).dot(basis_x),
-            (source_point - center).dot(basis_y),
-        ))
-        if abs(projected.x) >= abs(projected.y):
-            source_y_levels.append(coordinate.y)
-        else:
-            source_x_levels.append(coordinate.x)
-
-    def clustered_levels(values):
-        result = []
-        tolerance = max(scale * 1.0e-5, epsilon * 16.0)
-        for value in sorted(values):
-            if result and abs(value - result[-1][-1]) <= tolerance:
-                result[-1].append(value)
-            else:
-                result.append([value])
-        return [sum(cluster) / len(cluster) for cluster in result]
-
-    def grid_levels(values, minimum, maximum, intervals):
-        margin = max(scale * 1.0e-5, epsilon * 16.0)
-        candidates = [
-            value for value in clustered_levels(values)
-            if minimum + margin < value < maximum - margin
-        ]
-        desired = intervals - 1
-        if not candidates:
-            return [
-                minimum + (maximum - minimum) * step / intervals
-                for step in range(1, intervals)
-            ]
-        if len(candidates) <= desired:
-            return candidates
-        available = set(range(len(candidates)))
-        selected = []
-        for step in range(1, intervals):
-            target = minimum + (maximum - minimum) * step / intervals
-            index = min(
-                available,
-                key=lambda candidate: abs(candidates[candidate] - target),
-            )
-            available.remove(index)
-            selected.append(candidates[index])
-        return sorted(selected)
-
-    x_levels = grid_levels(
-        source_x_levels, minimum_x, maximum_x, x_intervals
-    )
-    y_levels = grid_levels(
-        source_y_levels, minimum_y, maximum_y, y_intervals
-    )
-    x_intervals = len(x_levels) + 1
-    y_intervals = len(y_levels) + 1
-
-    raw_chords = []
-    for dimension, levels in (
-        (0, x_levels),
-        (1, y_levels),
-    ):
-        for value in levels:
-            intersections = _grid_line_intersections(
-                boundary, dimension, value, epsilon
-            )
-            for first, second in zip(intersections, intersections[1:]):
-                midpoint = (first[3] + second[3]) * 0.5
-                if _point_in_polygon_2d(midpoint, boundary):
-                    raw_chords.append((first[1:3], second[1:3]))
-
-    if not raw_chords:
-        raise FairingError("Organic grid did not cross the opening")
-
-    exit_factors = {index: [] for index in range(len(boundary))}
-    normalized_chords = []
-    endpoint_tolerance = max(epsilon * 16.0 / scale, 1.0e-6)
-
-    def boundary_reference(segment, factor):
-        if factor <= endpoint_tolerance:
-            return ("VERT", segment)
-        if factor >= 1.0 - endpoint_tolerance:
-            return ("VERT", (segment + 1) % len(boundary))
-        factors = exit_factors[segment]
-        match = next(
-            (value for value in factors if abs(value - factor) <= endpoint_tolerance),
-            None,
-        )
-        if match is None:
-            factors.append(factor)
-            match = factor
-        return ("EDGE", segment, match)
-
-    for first, second in raw_chords:
-        normalized_chords.append((
-            boundary_reference(*first),
-            boundary_reference(*second),
-        ))
-
-    expanded = []
-    original_indices = {}
-    exit_indices = {}
-    for index, point in enumerate(boundary):
-        original_indices[index] = len(expanded)
-        expanded.append(point)
-        following = boundary[(index + 1) % len(boundary)]
-        for factor in sorted(exit_factors[index]):
-            exit_indices[(index, factor)] = len(expanded)
-            expanded.append(point.lerp(following, factor))
-
-    def reference_index(reference):
-        if reference[0] == "VERT":
-            return original_indices[reference[1]]
-        return exit_indices[(reference[1], reference[2])]
-
-    chord_edges = []
-    seen_chords = set()
-    for first_reference, second_reference in normalized_chords:
-        first = reference_index(first_reference)
-        second = reference_index(second_reference)
-        if first != second:
-            key = tuple(sorted((first, second)))
-            if key not in seen_chords:
-                seen_chords.add(key)
-                chord_edges.append((first, second))
-    if not chord_edges:
-        raise FairingError("Organic grid produced no clipped interior lines")
-
-    boundary_input_count = len(expanded)
-    boundary_edges_2d = [
-        (index, (index + 1) % boundary_input_count)
-        for index in range(boundary_input_count)
-    ]
-
-    def triangulate():
-        return delaunay_2d_cdt(
-            expanded,
-            boundary_edges_2d + chord_edges,
-            [list(range(boundary_input_count))],
-            4,
-            epsilon,
-        )
-
-    output = triangulate()
-    output_coords, _output_edges, output_faces, orig_verts, _orig_edges, _orig_faces = output
-    if not any(
-        not any(index < boundary_input_count for index in source_indices)
-        for source_indices in orig_verts
-    ):
-        # A simplified polygon can leave only edge-collinear extensions (for
-        # example, the four corners of a rectangular opening). Seed its center
-        # so the height solve still has an interior degree of freedom.
-        expanded.append(
-            sum(boundary, Vector((0.0, 0.0))) / len(boundary)
-        )
-        output = triangulate()
-        output_coords, _output_edges, output_faces, orig_verts, _orig_edges, _orig_faces = output
-    if not output_faces:
-        raise FairingError("Organic grid triangulation produced no interior faces")
-    return {
-        "center": center,
-        "axis": axis,
-        "basis_x": basis_x,
-        "basis_y": basis_y,
-        "direction_singular_values": singular_values,
-        "grid_shape": (x_intervals, y_intervals),
-        "epsilon": epsilon,
-        "input_coords": expanded,
-        "exit_factors": exit_factors,
-        "output_coords": output_coords,
-        "output_faces": output_faces,
-        "orig_verts": orig_verts,
-    }
-
-
-def _split_organic_boundary(bm, loop_verts, exit_factors):
-    """Split boundary edges at every generated chord endpoint."""
-    expanded_verts = []
-    count = len(loop_verts)
-    for index, start in enumerate(loop_verts):
-        end = loop_verts[(index + 1) % count]
-        expanded_verts.append(start)
-        original_start = start.co.copy()
-        original_end = end.co.copy()
-        current = start
-        previous_factor = 0.0
-        for factor in sorted(exit_factors[index]):
-            edge = bm.edges.get((current, end))
-            if edge is None:
-                raise FairingError("Organic grid could not split its boundary")
-            relative_factor = (factor - previous_factor) / (1.0 - previous_factor)
-            _new_edge, new_vert = bmesh.utils.edge_split(
-                edge, current, relative_factor
-            )
-            new_vert.co = original_start.lerp(original_end, factor)
-            expanded_verts.append(new_vert)
-            current = new_vert
-            previous_factor = factor
-    return expanded_verts
-
-
-def _create_organic_grid(
-    bm, loop_verts, loop_edges, matrix_world, layout=None
-):
-    """Create an axis-height patch from the clipped, SVD-aligned grid."""
-    inverse = matrix_world.inverted_safe()
-    layout = layout or _organic_grid_layout(
-        loop_verts, loop_edges, matrix_world
-    )
-    boundary_verts = _split_organic_boundary(
-        bm, loop_verts, layout["exit_factors"]
-    )
-    output_verts = []
-    new_verts = []
-    boundary_count = len(boundary_verts)
-    for coordinate, source_indices in zip(
-        layout["output_coords"], layout["orig_verts"]
-    ):
-        source = next(
-            (index for index in source_indices if index < boundary_count),
-            None,
-        )
-        if source is None:
-            nearest = min(
-                range(boundary_count),
-                key=lambda index: (
-                    layout["input_coords"][index] - coordinate
-                ).length_squared,
-            )
-            if (
-                layout["input_coords"][nearest] - coordinate
-            ).length <= layout["epsilon"] * 16.0:
-                source = nearest
-        if source is not None:
-            output_verts.append(boundary_verts[source])
-            continue
-        world = (
-            layout["center"]
-            + layout["basis_x"] * coordinate.x
-            + layout["basis_y"] * coordinate.y
-        )
-        vert = bm.verts.new(inverse @ world)
-        output_verts.append(vert)
-        new_verts.append(vert)
-
-    faces = []
-    for indices in layout["output_faces"]:
-        if len(indices) < 3:
-            continue
-        polygon = [layout["output_coords"][index] for index in indices]
-        if abs(_signed_area_2d(polygon)) <= layout["epsilon"] ** 2:
-            continue
-        faces.append(_new_face(bm, tuple(output_verts[index] for index in indices)))
-    if not faces or not new_verts:
-        raise FairingError("Organic grid produced no interior topology")
-    return new_verts, faces, boundary_verts, layout
 
 
 def _create_plane_patch(bm, loop_verts, loop_edges, center_local):
@@ -1497,6 +1242,8 @@ def _organic_depth_samples(
             edge.other_vert(vert)
             for edge in vert.link_edges
             if edge.other_vert(vert) not in new_set
+            and not edge.hide and not edge.other_vert(vert).hide
+            and (not edge.link_faces or any(not face.hide for face in edge.link_faces))
         )
 
     raw_samples = []
@@ -1559,9 +1306,10 @@ def _fair_organic_depth(
     axis,
     basis_x,
     basis_y,
+    depth_samples=None,
 ):
     """Continue the surrounding surface with a smooth thin-plate height field."""
-    points, heights = _organic_depth_samples(
+    points, heights = depth_samples if depth_samples is not None else _organic_depth_samples(
         new_verts,
         boundary_verts,
         matrix_world,
@@ -1650,96 +1398,6 @@ def _fair_organic_depth(
     return True
 
 
-def _simplify_organic_boundary(bm, loop_verts, loop_edges):
-    """Dissolve only redundant boundary-only verts before grid construction.
-
-    Vertices carrying a non-loop spoke encode source-grid alignment and must be
-    preserved. The 10-degree limit is evaluated from their adjacent support
-    face normals, matching Limited Dissolve's surface-angle meaning without
-    exposing the spoke/exterior edges to the dissolve operation.
-    """
-    original_points = [vert.co.copy() for vert in loop_verts]
-    support_faces = {
-        face for edge in loop_edges for face in edge.link_faces if face.is_valid
-    }
-    normal_limit = math.cos(ORGANIC_BOUNDARY_DISSOLVE_ANGLE)
-
-    while len(loop_verts) > 3:
-        boundary_edges = set(loop_edges)
-        candidates = []
-        for index, vert in enumerate(loop_verts):
-            if any(
-                edge.is_valid and edge not in boundary_edges
-                for edge in vert.link_edges
-            ):
-                continue
-            linked_faces = {
-                face
-                for edge in vert.link_edges
-                if edge in boundary_edges
-                for face in edge.link_faces
-                if face.is_valid
-            }
-            if linked_faces and min(
-                first.normal.dot(second.normal)
-                for first in linked_faces
-                for second in linked_faces
-            ) >= normal_limit:
-                candidates.append(index)
-        if not candidates:
-            break
-
-        chosen = []
-        maximum = len(loop_verts) - 3
-        for index in candidates:
-            if len(chosen) >= maximum:
-                break
-            if (
-                (index - 1) % len(loop_verts) in chosen
-                or (index + 1) % len(loop_verts) in chosen
-            ):
-                continue
-            chosen.append(index)
-        if (
-            len(loop_verts) > 2
-            and 0 in chosen
-            and len(loop_verts) - 1 in chosen
-        ):
-            chosen.pop()
-        if not chosen:
-            break
-        bmesh.ops.dissolve_verts(
-            bm,
-            verts=[loop_verts[index] for index in chosen],
-            use_face_split=False,
-            use_boundary_tear=False,
-        )
-        bm.normal_update()
-        loop_verts, loop_edges = _rediscover_boundary(
-            bm, original_points, support_faces
-        )
-    return loop_verts, loop_edges
-
-
-def _project_patch_to_analytic_surface(
-    new_verts, matrix_world, hypothesis
-):
-    """Project arbitrary patch topology onto a conic or spherical fit."""
-    inverse = matrix_world.inverted_safe()
-    if hypothesis["method"] == "CONIC":
-        project = lambda point: _project_conic(point, hypothesis["fit"])
-    elif hypothesis["method"] == "SPHERE":
-        center = hypothesis["center"]
-        fallback = matrix_world @ new_verts[0].co - center
-        project = lambda point: _project_sphere(
-            point, center, hypothesis["radius"], fallback
-        )
-    else:
-        return
-    for vert in new_verts:
-        vert.co = inverse @ project(matrix_world @ vert.co)
-
-
 def resolved_fill_style(hypothesis, fill_style='AUTO'):
     """Resolve an explicit or automatic patch-topology choice."""
     if fill_style != 'AUTO':
@@ -1751,7 +1409,7 @@ def resolved_fill_style(hypothesis, fill_style='AUTO'):
         and not hypothesis["fit"].get("is_cone", False)
     ):
         return 'CYLINDER'
-    if hypothesis["method"] == "ORGANIC":
+    if hypothesis["method"] in {"ORGANIC", "SPHERE"}:
         return 'GRID'
     return 'CIRCLE'
 
@@ -1764,21 +1422,26 @@ def prepare_fair_boundary(
     hypothesis,
     fill_style='AUTO',
 ):
-    """Apply the shared pre-fair simplify and retain source-grid directions."""
+    """Apply pre-fair simplification to a non-Grid analytic/circular fill."""
     topology = resolved_fill_style(hypothesis, fill_style)
-    direction_samples = (
-        _organic_direction_samples(loop_verts, loop_edges, obj.matrix_world)
-        if topology == 'GRID'
-        else None
-    )
+    completed_faces = []
     if topology == 'CYLINDER' or hypothesis["method"] == "SPHERE":
         bm, loop_verts, loop_edges = _limited_dissolve_analytic_boundary(
-            obj, bm, loop_verts, loop_edges
+            obj, bm, loop_verts, loop_edges, completed_faces=completed_faces,
         )
     else:
         loop_verts, loop_edges = limited_dissolve_boundary(
-            bm, loop_verts, loop_edges
+            bm, loop_verts, loop_edges, completed_faces=completed_faces,
         )
+    result = None
+    if not loop_edges:
+        result = {
+            'method': 'PLANES', 'fill_style': 'PLANE', 'residual': 0.0,
+            'boundary_dissolved': True,
+            'faces': completed_faces,
+            'verts': list({vert for face in completed_faces for vert in face.verts}),
+            'boundary_verts': [], 'boundary_edges': [],
+        }
     forced_method = (
         'CYLINDER' if topology == 'CYLINDER'
         else 'SPHERE' if hypothesis["method"] == 'SPHERE'
@@ -1788,8 +1451,8 @@ def prepare_fair_boundary(
         "bm": bm,
         "loop_verts": loop_verts,
         "loop_edges": loop_edges,
-        "direction_samples": direction_samples,
         "forced_method": forced_method,
+        "result": result,
     }
 
 
@@ -1802,6 +1465,10 @@ def finalize_fair_patch(
     final_simplify=True,
 ):
     """Apply the shared seam weld and optional post-fair simplification."""
+    if result.get("method") in {'GRID_PREP', 'GRID_ROWS'}:
+        # Boundary preparation already replaces the circular cut with source
+        # grid corners. Dissolving the completed net would destroy those quads.
+        return bm, result
     if result["fill_style"] == 'CYLINDER' and final_simplify:
         bm, dissolved = _limited_dissolve_cylinder_patch(
             obj, bm, result["faces"]
@@ -1833,22 +1500,24 @@ def fair_boundary_loop(
     hypothesis,
     fill_style='AUTO',
     circle_loops=PATCH_RINGS,
-    grid_angle=0.0,
-    direction_samples=None,
+    match_curvature=True,
 ):
     """Create the accepted patch and return its method/new topology."""
     topology = resolved_fill_style(hypothesis, fill_style)
+    if topology == 'GRID':
+        from .grid_patcher import prepare_grid_steps
+        return prepare_grid_steps(bm, loop_verts, loop_edges, matrix_world,
+                                  'ROWS', refinement_passes=1,
+                                  match_curvature=match_curvature, hypothesis=hypothesis)
 
-    organic_direction_samples = direction_samples
-    if hypothesis["method"] == "ORGANIC" or topology == 'GRID':
-        if organic_direction_samples is None:
-            organic_direction_samples = _organic_direction_samples(
-                loop_verts, loop_edges, matrix_world
-            )
-        loop_verts, loop_edges = _simplify_organic_boundary(
-            bm, loop_verts, loop_edges
-        )
     layout = None
+    organic_surface = None
+    if hypothesis['method'] == 'ORGANIC':
+        from .ideal_surface import capture_organic_surface
+        center, axis, basis_x, basis_y, _points = _organic_projection_frame(loop_verts, matrix_world)
+        layout = dict(center=center, axis=axis, basis_x=basis_x, basis_y=basis_y)
+        organic_surface = capture_organic_surface(loop_verts, matrix_world, center, basis_x, basis_y, axis,
+                                                   match_curvature=match_curvature)
     if topology == 'PLANE':
         inverse = matrix_world.inverted_safe()
         new_verts, new_faces = _create_plane_patch(
@@ -1861,48 +1530,6 @@ def fair_boundary_loop(
         new_verts, new_faces = _create_cylinder_patch(
             bm, loop_verts, loop_edges, matrix_world, hypothesis
         )
-    elif topology == 'GRID':
-        ordered = _orient_loop(
-            loop_verts,
-            loop_edges,
-            sum((vert.co for vert in loop_verts), Vector((0.0, 0.0, 0.0)))
-            / len(loop_verts),
-        )
-        if ordered[0] is not loop_verts[0]:
-            loop_verts = ordered
-            loop_edges = [
-                bm.edges.get((vert, ordered[(index + 1) % len(ordered)]))
-                for index, vert in enumerate(ordered)
-            ]
-        try:
-            layout = _organic_grid_layout(
-                loop_verts,
-                loop_edges,
-                matrix_world,
-                organic_direction_samples,
-                grid_angle,
-            )
-        except FairingError:
-            center, axis, basis_x, basis_y, _points = (
-                _organic_projection_frame(loop_verts, matrix_world)
-            )
-            new_verts, new_faces = _create_plane_patch(
-                bm, loop_verts, loop_edges, matrix_world.inverted_safe() @ center
-            )
-            layout = {
-                "center": center,
-                "axis": axis,
-                "basis_x": basis_x,
-                "basis_y": basis_y,
-            }
-        else:
-            new_verts, new_faces, loop_verts, layout = _create_organic_grid(
-                bm, loop_verts, loop_edges, matrix_world, layout
-            )
-        loop_edges = [
-            bm.edges.get((vert, loop_verts[(index + 1) % len(loop_verts)]))
-            for index, vert in enumerate(loop_verts)
-        ]
     else:
         new_verts, new_faces = _create_radial_patch(
             bm,
@@ -1913,13 +1540,16 @@ def fair_boundary_loop(
             circle_loops,
         )
 
-    if topology == 'GRID' and hypothesis["method"] in {'CONIC', 'SPHERE'}:
-        _project_patch_to_analytic_surface(
-            new_verts, matrix_world, hypothesis
-        )
-    elif hypothesis["method"] == 'ORGANIC' or (
-        topology == 'GRID' and hypothesis["method"] == 'PLANES'
-    ):
+    if hypothesis["method"] == 'ORGANIC':
+        if organic_surface is not None:
+            offsets = [matrix_world @ v.co - layout['center'] for v in new_verts]
+            queries = [(p.dot(layout['basis_x']), p.dot(layout['basis_y'])) for p in offsets]
+            targets = organic_surface.evaluate_chart(queries)
+            if not np.isfinite(targets).all():
+                raise FairingError('The organic surface projection was not finite')
+            inverse = matrix_world.inverted_safe()
+            for vert, target in zip(new_verts, targets):
+                vert.co = inverse @ Vector(target)
         if layout is None:
             center, axis, basis_x, basis_y, _points = (
                 _organic_projection_frame(loop_verts, matrix_world)
@@ -1930,7 +1560,7 @@ def fair_boundary_loop(
                 "basis_x": basis_x,
                 "basis_y": basis_y,
             }
-        if not _fair_organic_depth(
+        if organic_surface is None and not _fair_organic_depth(
             new_verts,
             loop_verts,
             matrix_world,
@@ -1942,16 +1572,21 @@ def fair_boundary_loop(
             bmesh.ops.delete(bm, geom=list(new_verts), context='VERTS')
             raise FairingError("Organic curvature solve was singular")
 
-    bm.normal_update()
+    update_visible_normals(bm)
     if any(face.calc_area() <= 1.0e-14 for face in new_faces):
         bmesh.ops.delete(bm, geom=list(new_verts), context='VERTS')
         raise FairingError("The fitted patch produced degenerate faces")
     return {
         "method": hypothesis["method"],
         "fill_style": topology,
+        "grid_layout": layout.get("layout_method", "") if layout is not None else "",
+        "grid_estimated_edge_length": layout.get("estimated_edge_length", 0.0) if layout else 0.0,
+        "grid_target_edge_length": layout.get("target_edge_length", 0.0) if layout else 0.0,
         "residual": hypothesis.get("residual", 0.0),
         "verts": new_verts,
         "faces": new_faces,
         "boundary_verts": loop_verts,
         "boundary_edges": loop_edges,
+        "surface_continuity": organic_surface.continuity if organic_surface is not None else
+                              'THIN_PLATE' if hypothesis['method'] == 'ORGANIC' else 'ANALYTIC',
     }

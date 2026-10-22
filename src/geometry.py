@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Amos Manneschmidt
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Circular-cone fitting and mesh deformation for Resize Hole."""
+"""Resize deformation, transactional reconstruction, and preview lifecycle."""
 
 import hashlib
 import heapq
@@ -10,42 +10,38 @@ import time
 
 import bmesh
 import bpy
-import numpy as np
 
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 from mathutils.kdtree import KDTree
 
-from .constants import (
-    PARALLEL_PLANE_ANGLE_EPSILON,
-    PLANE_FIT_ABSOLUTE_EPSILON,
-    PLANE_FIT_RELATIVE_EPSILON,
-)
+from .constants import PARALLEL_PLANE_ANGLE_EPSILON
 from .fairing import (
     FairingError,
     LIMITED_DISSOLVE_ANGLE,
     boundary_component,
     choose_hypothesis,
     expanded_limited_dissolve,
-    fair_boundary_loop,
-    finalize_fair_patch,
     ordered_boundary_loop,
-    prepare_fair_boundary,
 )
 
+from .fairing_pipeline import fair_hole_patch
+from .mesh_state import restore_mesh_contents
+from .boolean_transaction import BooleanTransaction
+from .visible_geometry import detach_hidden_geometry, is_visible_vertex, update_visible_normals
+from .resize_surfaces import ResizeSurfaceMixin
+from .resize_state import invalidate_projection, reset_deformation
 
-_CONE_ANGLE_EPSILON = math.radians(0.1)
-_CONE_RELATIVE_FIT_EPSILON = 0.05
-_MAX_GENERATOR_ALIGNMENT = 0.985
+
 _BOOLEAN_PREVIEW_INTERVAL = 0.5
 
 
-class GeometryMixin:
-    """Provide selection, fitting, and deformation algorithms to the operator.
+class GeometryMixin(ResizeSurfaceMixin):
+    """Compose fitting, surface policy, bore handling, and mesh deformation.
 
     Cone fits and boundary planes are expressed in world space. A cylinder is
-    represented as the zero-slope special case. Original
-    BMesh vertex coordinates are retained in object-local space so every update
+    represented as the zero-slope special case. Original BMesh vertex
+    coordinates are retained in object-local space so every update
     can be rebuilt from the same undeformed geometry instead of accumulating
     floating-point error.
     """
@@ -75,7 +71,7 @@ class GeometryMixin:
         return GeometryMixin._canonical_topology_signature(
             len(bm.verts),
             len(bm.edges),
-            ([vert.index for vert in face.verts] for face in bm.faces),
+            ([vert.index for vert in face.verts] for face in bm.faces if not face.hide),
         )
 
     @staticmethod
@@ -89,7 +85,7 @@ class GeometryMixin:
         return GeometryMixin._canonical_topology_signature(
             len(mesh.vertices),
             len(mesh.edges),
-            (polygon.vertices for polygon in mesh.polygons),
+            (polygon.vertices for polygon in mesh.polygons if not polygon.hide),
         )
 
     @staticmethod
@@ -131,7 +127,14 @@ class GeometryMixin:
         object-local coordinates are stored on the operator for repeatable live
         updates.
         """
-        selected_verts = set(selected_verts)
+        selected_verts = {vert for vert in selected_verts if is_visible_vertex(vert)}
+        bm.verts.ensure_lookup_table()
+        selected_verts.update(
+            bm.verts[index]
+            for index in getattr(self, "_resize_conic_surfaces_by_vertex", {})
+            if index < len(bm.verts)
+            and is_visible_vertex(bm.verts[index])
+        )
         matrix_world = self._object.matrix_world
         weights = {vert.index: 1.0 for vert in selected_verts}
         tool_settings = context.scene.tool_settings
@@ -153,7 +156,7 @@ class GeometryMixin:
                     vert = bm.verts[vertex_index]
                     for edge in vert.link_edges:
                         neighbor = edge.other_vert(vert)
-                        if neighbor.hide:
+                        if not is_visible_vertex(neighbor):
                             continue
                         edge_length = (
                             matrix_world @ neighbor.co - matrix_world @ vert.co
@@ -190,7 +193,7 @@ class GeometryMixin:
                     nearest_selected.insert(point, index)
                 nearest_selected.balance()
                 for vert in bm.verts:
-                    if vert.hide or vert in selected_verts:
+                    if vert in selected_verts or not is_visible_vertex(vert):
                         continue
                     point = matrix_world @ vert.co
                     if projected:
@@ -217,1263 +220,15 @@ class GeometryMixin:
             index: bm.verts[index].co.copy() for index in weights
         }
 
-    def _world_normal(self, face):
-        """Return a BMesh face normal transformed correctly into world space."""
-        normal_matrix = self._object.matrix_world.to_3x3().inverted_safe().transposed()
-        return (normal_matrix @ face.normal).normalized()
-
-    def _flood_fill(self, seed):
-        """Collect the smooth, edge-connected face region containing ``seed``.
-
-        A visible neighboring face is admitted when its world-space normal is
-        within ``self.flood_angle`` of the current face normal. Comparing each
-        pair of adjacent faces allows the fill to follow a curved cylinder. The
-        method returns faces without changing Blender's actual mesh selection.
-        """
-        threshold = math.cos(self.flood_angle)
-        result = {seed}
-        stack = [seed]
-        normal_cache = {}
-
-        def world_normal(face):
-            normal = normal_cache.get(face)
-            if normal is None:
-                normal = self._world_normal(face)
-                normal_cache[face] = normal
-            return normal
-
-        while stack:
-            face = stack.pop()
-            face_normal = world_normal(face)
-            for edge in face.edges:
-                for neighbor in edge.link_faces:
-                    if neighbor in result or neighbor.hide:
-                        continue
-                    if face_normal.dot(world_normal(neighbor)) >= threshold:
-                        result.add(neighbor)
-                        stack.append(neighbor)
-        return GeometryMixin._extend_flood_across_gaps(self, result)
-
-    def _extend_flood_across_gaps(self, connected_faces):
-        """Add disconnected wall remnants compatible with a provisional fit.
-
-        A missing face breaks edge traversal even though the surfaces on either
-        side still describe the same hole. Once the connected patch can define a
-        cone, test other visible faces against its axial span, radial model, and
-        expected wall normal. The deliberately tight tolerances bridge local
-        defects without collecting end caps or remote coaxial features.
-        """
-        result = set(connected_faces)
-        if len(result) < 3:
-            return result
-        try:
-            fit = GeometryMixin._fit_cylinder(self, list(result))
-        except (ValueError, np.linalg.LinAlgError):
-            return result
-
-        bm = bmesh.from_edit_mesh(self._object.data)
-        bm.faces.ensure_lookup_table()
-        matrix_world = self._object.matrix_world
-        axis = fit["axis"]
-        center = fit["center"]
-        slope = fit.get("slope", 0.0)
-        axial_extent = max(fit["z_max"] - fit["z_min"], 1.0e-9)
-        axial_tolerance = max(axial_extent * 0.08, fit["radius"] * 0.08)
-        radial_tolerance = max(
-            fit["radius"] * 0.08,
-            fit.get("fit_relative_error", 0.0) * fit["radius"] * 3.0,
-            1.0e-7,
-        )
-        normal_threshold = math.cos(math.radians(25.0))
-
-        for face in bm.faces:
-            if face in result or face.hide:
-                continue
-            point = matrix_world @ face.calc_center_median()
-            offset = point - center
-            coordinate = offset.dot(axis)
-            if not (
-                fit["z_min"] - axial_tolerance
-                <= coordinate
-                <= fit["z_max"] + axial_tolerance
-            ):
-                continue
-            radial = offset - axis * coordinate
-            if radial.length_squared <= 1.0e-16:
-                continue
-            expected_radius = fit["radius"] + slope * coordinate
-            if expected_radius <= 1.0e-9:
-                continue
-            if abs(radial.length - expected_radius) > radial_tolerance:
-                continue
-            expected_normal = (radial.normalized() - axis * slope).normalized()
-            if abs(self._world_normal(face).dot(expected_normal)) < normal_threshold:
-                continue
-            result.add(face)
-        return result
-
-    def _fit_cylinder(self, faces):
-        """Fit a world-space circular cone, including its cylindrical limit.
-
-        This mirrors the bundled ``Fit Circular Cone`` Geometry Nodes asset.
-        PCA of centered wall normals finds the axis. Planes whose normals are
-        ``axis × wall_normal`` all contain that axis, so their least-squares
-        intersection recovers an axis line even when faces are missing. Radius
-        is then regressed against distance along the line. A meaningful, low-
-        residual slope identifies a cone; otherwise the fit remains cylindrical.
-
-        The historical method name is retained because it is part of the
-        operator's internal redo/test surface.
-        """
-        matrix_world = self._object.matrix_world
-        verts = {vert for face in faces for vert in face.verts}
-        if len(verts) < 6 or len(faces) < 3:
-            raise ValueError("The flood fill needs at least three faces and six vertices")
-
-        points = np.asarray([matrix_world @ vert.co for vert in verts], dtype=np.float64)
-        face_points = []
-        normals = []
-        weights = []
-        for face in faces:
-            face_points.append(
-                np.asarray(matrix_world @ face.calc_center_median(), dtype=np.float64)
-            )
-            normals.append(np.asarray(self._world_normal(face), dtype=np.float64))
-            weights.append(max(face.calc_area(), 1.0e-12))
-        face_points = np.asarray(face_points)
-        normals = np.asarray(normals)
-        weights = np.asarray(weights)
-
-        # Circular-cone normals terminate in a plane. Centering them before SVD
-        # makes its normal the cone axis, including for a partial angular patch.
-        normal_mean = np.average(normals, axis=0, weights=weights)
-        centered_normals = (normals - normal_mean) * np.sqrt(weights)[:, None]
-        _u, _singular_values, vh = np.linalg.svd(
-            centered_normals, full_matrices=False
-        )
-        axis = Vector(vh[-1]).normalized()
-        if axis.length_squared <= 1.0e-16:
-            raise ValueError("The selected wall does not define a stable axis")
-
-        # The cross product is normal to each meridional plane through the cone
-        # axis. Their least-squares intersection has rank two for a usable line.
-        meridional_normals = np.cross(np.asarray(axis), normals)
-        lengths = np.linalg.norm(meridional_normals, axis=1)
-        usable = lengths > 1.0e-8
-        if np.count_nonzero(usable) < 3:
-            raise ValueError("The selected wall does not define a stable axis")
-        meridional_normals = meridional_normals[usable] / lengths[usable, None]
-        plane_weights = np.sqrt(weights[usable])
-        system = meridional_normals * plane_weights[:, None]
-        rhs = np.einsum(
-            'ij,ij->i', meridional_normals, face_points[usable]
-        ) * plane_weights
-        axis_seed, _residuals, axis_rank, _values = np.linalg.lstsq(
-            system, rhs, rcond=None
-        )
-        if axis_rank < 2:
-            raise ValueError("The selected wall does not define a stable axis")
-
-        mean = Vector(points.mean(axis=0))
-        seed = Vector(axis_seed)
-        center = seed + axis * (mean - seed).dot(axis)
-
-        reference = Vector((0.0, 0.0, 1.0))
-        if abs(axis.dot(reference)) > 0.9:
-            reference = Vector((0.0, 1.0, 0.0))
-        basis_x = axis.cross(reference).normalized()
-        basis_y = axis.cross(basis_x).normalized()
-
-        relative = [Vector(point) - center for point in points]
-        x = np.asarray([point.dot(basis_x) for point in relative])
-        y = np.asarray([point.dot(basis_y) for point in relative])
-        z = np.asarray([point.dot(axis) for point in relative])
-        radial_distances = np.hypot(x, y)
-
-        regression = np.column_stack((z, np.ones_like(z)))
-        solution, _residuals, rank, _values = np.linalg.lstsq(
-            regression, radial_distances, rcond=None
-        )
-        if rank < 2:
-            raise ValueError("The selected wall has no measurable axial extent")
-        fitted_slope, fitted_radius = map(float, solution)
-        if fitted_radius <= 1.0e-12:
-            raise ValueError("The fitted wall radius is zero")
-        predicted = fitted_radius + fitted_slope * z
-        residual_rms = float(np.sqrt(np.mean((radial_distances - predicted) ** 2)))
-        relative_error = residual_rms / max(float(radial_distances.mean()), 1.0e-12)
-        half_angle = math.atan(abs(fitted_slope))
-        is_cone = (
-            half_angle >= _CONE_ANGLE_EPSILON
-            and relative_error <= _CONE_RELATIVE_FIT_EPSILON
-            and float(predicted.min()) > 1.0e-9
-        )
-        slope = fitted_slope if is_cone else 0.0
-
-        if is_cone:
-            ratios = radial_distances / predicted
-            radius_estimates = {
-                'MINIMUM': fitted_radius * float(ratios.min()),
-                'AVERAGE': fitted_radius * float(ratios.mean()),
-                'MAXIMUM': fitted_radius * float(ratios.max()),
-            }
-        else:
-            radius_estimates = {
-                'MINIMUM': float(radial_distances.min()),
-                'AVERAGE': float(radial_distances.mean()),
-                'MAXIMUM': float(radial_distances.max()),
-            }
-        estimator = getattr(self, "diameter_estimator", 'AVERAGE')
-        if estimator == 'MINIMUM':
-            radius = radius_estimates['MINIMUM']
-        elif estimator == 'MAXIMUM':
-            radius = radius_estimates['MAXIMUM']
-        else:
-            radius = radius_estimates['AVERAGE']
-        if radius <= 1.0e-12:
-            raise ValueError("The fitted wall radius is zero")
-
-        # Mesh normals point radially away from a stud and toward the axis of a
-        # hole. Keep this distinction for choosing which end is attached to the
-        # surrounding model when depth changes.
-        wall_orientation = 0.0
-        for face in faces:
-            face_center = matrix_world @ face.calc_center_median()
-            face_offset = face_center - center
-            face_axial = axis * face_offset.dot(axis)
-            face_radial = face_offset - face_axial
-            if face_radial.length_squared <= 1.0e-16:
-                continue
-            wall_orientation += (
-                self._world_normal(face).dot(face_radial.normalized())
-                * max(face.calc_area(), 1.0e-12)
-            )
-        return {
-            "axis": axis,
-            "basis_x": basis_x,
-            "basis_y": basis_y,
-            "center": center,
-            "radius": radius,
-            "radius_estimates": radius_estimates,
-            "slope": slope,
-            "half_angle": math.atan(abs(slope)),
-            "is_cone": is_cone,
-            "fit_relative_error": relative_error,
-            "fit_rank": int(axis_rank),
-            "z_min": float(z.min()),
-            "z_max": float(z.max()),
-            "is_stud": wall_orientation >= 0.0,
-        }
-
-    def _fit_boundary_planes(self, faces, cylinder_axis, fit=None):
-        """Fit world-space end planes to connected wall-boundary components.
-
-        Boundary edges have exactly one face in the supplied region. Edges that
-        follow a fitted cone generator are missing-face defects, not end arcs,
-        and are discarded. Remaining fragments are combined into two axial end
-        groups before their planes are fitted, so neither closed loops nor
-        uninterrupted topology are required.
-
-        Each result records the component's vertex indices, a point on its
-        plane, its normal, and scale-aware planarity diagnostics. The diagnostics
-        let depth adjustment reject non-planar ends without losing the best-fit
-        planes used to preserve skewed cuts during diameter changes.
-        """
-        selected = set(faces)
-        boundary_edges = {
-            edge
-            for face in faces
-            for edge in face.edges
-            if sum(linked_face in selected for linked_face in edge.link_faces) == 1
-        }
-        matrix_world = self._object.matrix_world
-        if fit is not None:
-            axis_point = fit["center"]
-            slope = fit.get("slope", 0.0)
-            filtered_edges = set()
-            for edge in boundary_edges:
-                first = matrix_world @ edge.verts[0].co
-                second = matrix_world @ edge.verts[1].co
-                tangent = second - first
-                midpoint = (first + second) * 0.5
-                offset = midpoint - axis_point
-                radial = offset - cylinder_axis * offset.dot(cylinder_axis)
-                if (
-                    tangent.length_squared <= 1.0e-16
-                    or radial.length_squared <= 1.0e-16
-                ):
-                    continue
-                generator = (
-                    cylinder_axis + radial.normalized() * slope
-                ).normalized()
-                alignment = abs(tangent.normalized().dot(generator))
-                if alignment < _MAX_GENERATOR_ALIGNMENT:
-                    filtered_edges.add(edge)
-            boundary_edges = filtered_edges
-
-        remaining = set(boundary_edges)
-        components = []
-
-        while remaining:
-            seed = remaining.pop()
-            component_edges = {seed}
-            component_verts = set(seed.verts)
-            stack = [seed]
-            while stack:
-                edge = stack.pop()
-                for vert in edge.verts:
-                    for neighbor in vert.link_edges:
-                        if neighbor in remaining:
-                            remaining.remove(neighbor)
-                            component_edges.add(neighbor)
-                            component_verts.update(neighbor.verts)
-                            stack.append(neighbor)
-            components.append((component_verts, component_edges))
-
-        # Several omitted wall faces can split each circumferential end into
-        # multiple arcs. Merge fragments into two axial bands with weighted
-        # one-dimensional k-means before fitting the end planes.
-        if len(components) > 2:
-            component_data = []
-            for component_verts, component_edges in components:
-                midpoints = [
-                    (
-                        matrix_world @ edge.verts[0].co
-                        + matrix_world @ edge.verts[1].co
-                    ) * 0.5
-                    for edge in component_edges
-                ]
-                lengths = [
-                    (
-                        matrix_world @ edge.verts[1].co
-                        - matrix_world @ edge.verts[0].co
-                    ).length
-                    for edge in component_edges
-                ]
-                total = max(sum(lengths), 1.0e-12)
-                coordinate = sum(
-                    point.dot(cylinder_axis) * length
-                    for point, length in zip(midpoints, lengths)
-                ) / total
-                component_data.append(
-                    (coordinate, total, component_verts, component_edges)
-                )
-            centers = [
-                min(item[0] for item in component_data),
-                max(item[0] for item in component_data),
-            ]
-            if abs(centers[1] - centers[0]) > 1.0e-9:
-                assignments = None
-                for _iteration in range(12):
-                    next_assignments = [
-                        0
-                        if abs(item[0] - centers[0]) <= abs(item[0] - centers[1])
-                        else 1
-                        for item in component_data
-                    ]
-                    if next_assignments == assignments:
-                        break
-                    assignments = next_assignments
-                    for cluster in (0, 1):
-                        members = [
-                            item for item, assignment in zip(component_data, assignments)
-                            if assignment == cluster
-                        ]
-                        if members:
-                            centers[cluster] = sum(
-                                item[0] * item[1] for item in members
-                            ) / sum(item[1] for item in members)
-                merged = []
-                for cluster in (0, 1):
-                    cluster_verts = set()
-                    cluster_edges = set()
-                    for item, assignment in zip(component_data, assignments or ()):
-                        if assignment == cluster:
-                            cluster_verts.update(item[2])
-                            cluster_edges.update(item[3])
-                    if cluster_edges:
-                        merged.append((cluster_verts, cluster_edges))
-                components = merged
-
-        planes = []
-        for verts, edges in components:
-            if len(verts) < 3:
-                continue
-            points = np.asarray(
-                [matrix_world @ vert.co for vert in verts], dtype=np.float64
-            )
-            center = points.mean(axis=0)
-            _u, _singular_values, vh = np.linalg.svd(
-                points - center, full_matrices=False
-            )
-            normal = Vector(vh[-1]).normalized()
-            centered = points - center
-            extent = float(np.linalg.norm(centered, axis=1).max(initial=0.0))
-            max_error = float(
-                np.abs(centered @ np.asarray(normal)).max(initial=0.0)
-            )
-            tolerance = max(
-                getattr(
-                    self,
-                    "plane_fit_absolute_epsilon",
-                    PLANE_FIT_ABSOLUTE_EPSILON,
-                ),
-                extent
-                * getattr(
-                    self,
-                    "plane_fit_relative_epsilon",
-                    PLANE_FIT_RELATIVE_EPSILON,
-                ),
-            )
-
-            # A valid cylinder end surface must intersect lines parallel to the
-            # fitted axis. Skip longitudinal/open-patch boundaries.
-            if abs(normal.dot(cylinder_axis)) < 1.0e-5:
-                continue
-            adjacent_faces = {
-                face
-                for edge in edges
-                for face in edge.link_faces
-                if face not in selected and not face.hide
-            }
-            adjacent_normal = None
-            if adjacent_faces:
-                weighted_adjacent_normal = Vector((0.0, 0.0, 0.0))
-                for face in adjacent_faces:
-                    weighted_adjacent_normal += self._world_normal(face) * max(
-                        face.calc_area(), 1.0e-12
-                    )
-                if weighted_adjacent_normal.length_squared > 1.0e-16:
-                    adjacent_normal = weighted_adjacent_normal.normalized()
-            planes.append(
-                {
-                    "verts": sorted(vert.index for vert in verts),
-                    "point": Vector(center),
-                    "normal": normal,
-                    "max_error": max_error,
-                    "tolerance": tolerance,
-                    "adjacent_normal": adjacent_normal,
-                }
-            )
-        return sorted(planes, key=lambda plane: plane["verts"][0])
-
-    def _fit_adjustable_depth(self, planes, fit):
-        """Return fixed-side axial depth metadata for two planar end loops.
-
-        Depth is measured between each loop plane's intersection with the fitted
-        axis, so non-parallel ends remain adjustable. The outer/model-side loop is
-        selected from its adjacent face normal: for a hole that normal points away
-        from the cylindrical region, while a stud reverses the test. Missing or
-        ambiguous adjacent faces fall back to stable boundary-index ordering. Two
-        outward-facing hole ends identify a through-hole, which has no adjustable
-        depth.
-        """
-        if len(planes) != 2:
-            return None
-        if any(
-            plane.get("max_error", math.inf) > plane.get("tolerance", 0.0)
-            for plane in planes
-        ):
-            return None
-
-        axis = fit["axis"]
-        center = fit["center"]
-        coordinates = []
-        for plane in planes:
-            denominator = plane["normal"].dot(axis)
-            if abs(denominator) < 1.0e-5:
-                return None
-            coordinates.append(
-                plane["normal"].dot(plane["point"] - center) / denominator
-            )
-
-        initial = abs(coordinates[1] - coordinates[0])
-        if initial <= 1.0e-12:
-            return None
-
-        is_stud = bool(fit.get("is_stud", False))
-        into_scores = []
-        outer_scores = []
-        for index, plane in enumerate(planes):
-            adjacent_normal = plane.get("adjacent_normal")
-            if adjacent_normal is None:
-                into_scores.append(None)
-                outer_scores.append(None)
-                continue
-            other_coordinate = coordinates[1 - index]
-            into_region = axis * math.copysign(
-                1.0, other_coordinate - coordinates[index]
-            )
-            into_score = adjacent_normal.dot(into_region)
-            into_scores.append(into_score)
-            outer_scores.append(into_score if is_stud else -into_score)
-
-        # Both end faces of a manifold cylindrical through-hole point away from
-        # the selected wall. A cone still has a meaningful top-to-bottom depth,
-        # so retain its two recovered end arcs even when both rims are exposed.
-        if not is_stud and not fit.get("is_cone", False) and all(
-            score is not None and score <= 1.0e-5 for score in into_scores
-        ):
-            return None
-
-        scored_indices = [
-            index for index, score in enumerate(outer_scores) if score is not None
-        ]
-        if len(scored_indices) == 2 and not math.isclose(
-            outer_scores[scored_indices[0]],
-            outer_scores[scored_indices[1]],
-            rel_tol=1.0e-6,
-            abs_tol=1.0e-6,
-        ):
-            outer_index = max(
-                scored_indices, key=lambda index: outer_scores[index]
-            )
-        elif len(scored_indices) == 1:
-            scored_index = scored_indices[0]
-            outer_index = (
-                scored_index
-                if outer_scores[scored_index] > 0.0
-                else 1 - scored_index
-            )
-        elif fit.get("is_cone", False):
-            # Countersinks and tapered holes conventionally meet the model at
-            # their wider circle. This also gives incomplete topology a stable
-            # top-surface choice when adjacent-face evidence is unavailable.
-            outer_index = max(
-                range(2),
-                key=lambda index: (
-                    fit["radius"]
-                    + fit.get("slope", 0.0) * coordinates[index]
-                ),
-            )
-        else:
-            outer_index = 0
-        inner_index = 1 - outer_index
-        parallel_threshold = math.cos(
-            getattr(
-                self,
-                "parallel_plane_angle_epsilon",
-                PARALLEL_PLANE_ANGLE_EPSILON,
-            )
-        )
-        return {
-            "initial": initial,
-            "outer_coordinate": coordinates[outer_index],
-            "inner_coordinate": coordinates[inner_index],
-            "outer_plane_index": outer_index,
-            "inner_plane_index": inner_index,
-            "is_stud": is_stud,
-            "parallel": abs(
-                planes[0]["normal"].normalized().dot(
-                    planes[1]["normal"].normalized()
-                )
-            ) > parallel_threshold,
-        }
-
-    def _target_depth_scale(self):
-        """Return the axial scale requested by the optional depth property."""
-        depth_fit = getattr(self, "_depth_fit", None)
-        if not depth_fit or depth_fit["initial"] <= 1.0e-12:
-            return 1.0
-        return max(float(self.depth), 1.0e-9) / depth_fit["initial"]
-
-    def _radius_coordinate(self):
-        """Return the axial coordinate at which Diameter is measured."""
-        depth_fit = getattr(self, "_depth_fit", None)
-        if depth_fit:
-            return depth_fit["outer_coordinate"]
-        return float(self._fit.get("radius_coordinate", 0.0))
-
-    def _fitted_radius_at(self, coordinate):
-        """Evaluate the fitted cone radius at one axial coordinate."""
-        fit = self._fit
-        return max(
-            1.0e-9,
-            float(fit["radius"]) + float(fit.get("slope", 0.0)) * coordinate,
-        )
-
-    def _target_cone_slope(self):
-        """Return the signed slope requested by the optional angle property."""
-        fit_slope = float(self._fit.get("slope", 0.0))
-        if not getattr(self, "angle_valid", False):
-            return fit_slope
-        sign = -1.0 if fit_slope < 0.0 else 1.0
-        return sign * math.tan(
-            min(math.radians(89.0), max(0.0, float(self.conic_angle)))
-        )
-
-    def _target_radius_at(self, coordinate):
-        """Evaluate the requested cone radius, anchored at the top surface."""
-        anchor = GeometryMixin._radius_coordinate(self)
-        anchor_radius = (
-            max(float(self.diameter), 1.0e-9) * 0.5
-            if float(self.diameter) > 0.0
-            else GeometryMixin._fitted_radius_at(self, anchor) * float(self.scale)
-        )
-        return max(
-            1.0e-9,
-            anchor_radius
-            + GeometryMixin._target_cone_slope(self) * (coordinate - anchor),
-        )
-
-    def _target_scale(self):
-        """Convert the requested diameter into a radial deformation scale.
-
-        The legacy ``scale`` property remains a fallback for redo compatibility
-        when no positive diameter has been assigned.
-        """
-        fitted_diameter = GeometryMixin._fitted_radius_at(
-            self, GeometryMixin._radius_coordinate(self)
-        ) * 2.0
-        if fitted_diameter <= 1.0e-12:
-            return 1.0
-        if self.diameter <= 0.0:
-            return self.scale
-        return self.diameter / fitted_diameter
-
-    @staticmethod
-    def _surface_bvh(faces, matrix_world):
-        """Build a world-space BVH and useful ray span from BMesh faces."""
-        coordinates = []
-        polygons = []
-        for face in faces:
-            polygon = []
-            for vert in face.verts:
-                polygon.append(len(coordinates))
-                coordinates.append(matrix_world @ vert.co)
-            if len(polygon) >= 3:
-                polygons.append(polygon)
-        if not polygons:
-            return None, 0.0
-        bvh = BVHTree.FromPolygons(coordinates, polygons, all_triangles=False)
-        minimum = Vector((
-            min(point.x for point in coordinates),
-            min(point.y for point in coordinates),
-            min(point.z for point in coordinates),
-        ))
-        maximum = Vector((
-            max(point.x for point in coordinates),
-            max(point.y for point in coordinates),
-            max(point.z for point in coordinates),
-        ))
-        return bvh, max((maximum - minimum).length * 2.0, 1.0)
-
-    @staticmethod
-    def _ordered_supported_loop(component, support_by_edge):
-        """Order one unbranched edge component and its outside support faces."""
-        degree = {}
-        for edge in component:
-            for vert in edge.verts:
-                degree.setdefault(vert, []).append(edge)
-        endpoints = [
-            vert for vert, linked in degree.items() if len(linked) == 1
-        ]
-        if (
-            len(component) < 2
-            or any(len(linked) not in {1, 2} for linked in degree.values())
-            or len(endpoints) not in {0, 2}
-        ):
-            return None
-
-        start = (
-            min(endpoints, key=lambda vert: vert.index)
-            if endpoints
-            else min(component, key=lambda edge: edge.index).verts[0]
-        )
-        first_edge = min(degree[start], key=lambda edge: edge.index)
-        current_vert = start
-        current_edge = first_edge
-        visited = set()
-        verts = []
-        edges = []
-        supports = []
-        while current_edge not in visited:
-            visited.add(current_edge)
-            verts.append(current_vert)
-            edges.append(current_edge)
-            supports.append(support_by_edge[current_edge])
-            next_vert = current_edge.other_vert(current_vert)
-            candidates = [
-                edge for edge in degree[next_vert]
-                if edge is not current_edge
-            ]
-            if not candidates:
-                current_vert = next_vert
-                break
-            if len(candidates) != 1:
-                return None
-            current_vert = next_vert
-            current_edge = candidates[0]
-        closed = not endpoints
-        if len(visited) != len(component) or (
-            closed and current_vert is not start
-        ):
-            return None
-        if not closed:
-            verts.append(current_vert)
-        return verts, edges, supports, closed
-
-    def _support_patch_faces(
-        self, support_faces, selected_faces, loop_edges, rings=2
-    ):
-        """Collect a small support patch without crossing the fitted wall rim."""
-        selected = set(selected_faces)
-        blocked = set(loop_edges)
-        patch = set(support_faces)
-        frontier = set(support_faces)
-        for _ring in range(rings):
-            following = set()
-            for face in frontier:
-                for edge in face.edges:
-                    if edge in blocked:
-                        continue
-                    for neighbor in edge.link_faces:
-                        if (
-                            neighbor is not face
-                            and neighbor not in selected
-                            and neighbor not in patch
-                            and not neighbor.hide
-                            and self._world_normal(face).dot(
-                                self._world_normal(neighbor)
-                            ) >= 0.9
-                        ):
-                            following.add(neighbor)
-            if not following:
-                break
-            patch.update(following)
-            frontier = following
-        return list(patch)
-
-    def _support_extends_outward(self, loop_verts, support_faces):
-        """Return whether a rim support continues away from the fitted wall."""
-        loop_set = set(loop_verts)
-        matrix_world = self._object.matrix_world
-        fit = self._fit
-        tolerance = max(float(fit["radius"]) * 1.0e-5, 1.0e-7)
-        outward = 0
-        tested = 0
-        for face in support_faces:
-            samples = [vert for vert in face.verts if vert not in loop_set]
-            if samples:
-                margins = []
-                for vert in samples:
-                    point = matrix_world @ vert.co
-                    offset = point - fit["center"]
-                    coordinate = offset.dot(fit["axis"])
-                    radial = offset - fit["axis"] * coordinate
-                    margins.append(
-                        radial.length
-                        - GeometryMixin._fitted_radius_at(self, coordinate)
-                    )
-                outward += max(margins) > tolerance
-            else:
-                # A cap n-gon may contain only rim vertices. Its centroid lies
-                # inward, whereas an exterior support without extra vertices is
-                # at worst neutral and should not create a false outward vote.
-                point = matrix_world @ face.calc_center_median()
-                offset = point - fit["center"]
-                coordinate = offset.dot(fit["axis"])
-                radial = offset - fit["axis"] * coordinate
-                outward += (
-                    radial.length
-                    - GeometryMixin._fitted_radius_at(self, coordinate)
-                ) > tolerance
-            tested += 1
-        # One genuine outward continuation is sufficient. Boolean-generated
-        # cube faces can leave most rim edges supported by triangles containing
-        # only boundary vertices, while just the corner-adjacent faces retain
-        # vertices beyond the fitted radius. A blind cap has no such vertex.
-        return tested > 0 and outward > 0
-
-    def _build_resize_projection_state(self, bm, selected_faces):
-        """Fit virtual endcap surfaces and snapshot the undeformed base mesh."""
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        bm.faces.ensure_lookup_table()
-        selected = set(selected_faces)
-        matrix_world = self._object.matrix_world
-        saved_angular_segments = int(
-            getattr(self, "fit_angular_segments", 0) or 0
-        )
-        self._resize_angular_segments = (
-            saved_angular_segments
-            if getattr(self, "fit_valid", False)
-            and saved_angular_segments >= 3
-            else GeometryMixin._estimate_angular_segments(self, selected)
-        )
-        base_faces = [
-            face for face in bm.faces
-            if face not in selected and not face.hide
-        ]
-        base_bvh, base_span = GeometryMixin._surface_bvh(
-            base_faces, matrix_world
-        )
-        self._resize_base_bvh = base_bvh
-        self._resize_base_span = base_span
-        self._resize_surfaces_by_vertex = {}
-
-        support_by_edge = {}
-        for face in selected:
-            for edge in face.edges:
-                if sum(linked in selected for linked in edge.link_faces) != 1:
-                    continue
-                supports = [
-                    linked for linked in edge.link_faces
-                    if linked not in selected and not linked.hide
-                ]
-                if supports:
-                    support_by_edge[edge] = max(
-                        supports, key=lambda support: support.calc_area()
-                    )
-
-        remaining = set(support_by_edge)
-        while remaining:
-            seed = remaining.pop()
-            component = {seed}
-            stack = [seed]
-            while stack:
-                edge = stack.pop()
-                for vert in edge.verts:
-                    for neighbor in vert.link_edges:
-                        if neighbor in remaining:
-                            remaining.remove(neighbor)
-                            component.add(neighbor)
-                            stack.append(neighbor)
-            ordered = GeometryMixin._ordered_supported_loop(
-                component, support_by_edge
-            )
-            if ordered is None:
-                continue
-            loop_verts, loop_edges, support_faces, closed = ordered
-            support_patch_faces = GeometryMixin._support_patch_faces(
-                self, support_faces, selected, loop_edges
-            )
-            try:
-                hypothesis = choose_hypothesis(
-                    loop_verts,
-                    loop_edges,
-                    matrix_world,
-                    lambda faces: GeometryMixin._fit_cylinder(self, faces),
-                    lambda face: GeometryMixin._world_normal(self, face),
-                    support_faces,
-                    analytic_faces=support_patch_faces,
-                    # Direct deformation is safe only for an actually planar
-                    # exterior. The looser default remains useful to Fair Hole
-                    # when it must tolerate noisy hand-built boundaries.
-                    plane_relative_tolerance=1.0e-5,
-                )
-            except (ValueError, np.linalg.LinAlgError):
-                continue
-            surface = {
-                "hypothesis": hypothesis,
-                "verts": {vert.index for vert in loop_verts},
-                "loop_verts": list(loop_verts),
-                "loop_edges": list(loop_edges),
-                "loop_world_points": [
-                    matrix_world @ vert.co for vert in loop_verts
-                ],
-                "support_faces": list(set(support_faces)),
-                "support_patch_faces": support_patch_faces,
-                "closed": closed,
-            }
-            surface["exterior"] = GeometryMixin._support_extends_outward(
-                self, loop_verts, surface["support_faces"]
-            )
-            if hypothesis.get("method") == "ORGANIC" and closed:
-                organic_bvh, organic_span = (
-                    GeometryMixin._build_virtual_organic_surface(
-                        self,
-                        bm,
-                        selected,
-                        loop_verts,
-                        loop_edges,
-                    )
-                )
-                surface["organic_bvh"] = organic_bvh
-                surface["organic_span"] = organic_span
-            for vert in loop_verts:
-                self._resize_surfaces_by_vertex[vert.index] = surface
-        unique_surfaces = {
-            id(surface): surface
-            for surface in self._resize_surfaces_by_vertex.values()
-        }.values()
-        self._resize_requires_boolean = (
-            not bool(self._fit.get("is_stud", False))
-            and any(
-                surface["exterior"]
-                and not (
-                    surface["hypothesis"].get("method") == "PLANES"
-                    and len(surface["hypothesis"].get("planes", ())) == 1
-                )
-                for surface in unique_surfaces
-            )
-        )
-        self._resize_base_requires_boolean = self._resize_requires_boolean
-        self._resize_dynamic_requires_boolean = False
-        self._resize_projection_ready = True
-
-    def _estimate_angular_segments(self, selected_faces):
-        """Estimate the source mesh's full-circle angular resolution.
-
-        Each distinct projected wall-face normal represents one angular facet.
-        Missing wall faces create one or more large angular gaps. The median of
-        the remaining cyclic gaps therefore preserves the source sampling while
-        ignoring extra rim/interior vertices and axial face subdivisions.
-        """
-        fit = self._fit
-        matrix_world = self._object.matrix_world
-        angles = []
-        axis = fit["axis"].normalized()
-        for face in selected_faces:
-            normal = GeometryMixin._world_normal(self, face)
-            radial_normal = normal - axis * normal.dot(axis)
-            if radial_normal.length <= 1.0e-9:
-                continue
-            # Holes and studs point their wall normals in opposite directions.
-            # Orient every sample toward its face center so mixed winding does
-            # not introduce artificial half-turn samples.
-            center_offset = (
-                matrix_world @ face.calc_center_median()
-            ) - fit["center"]
-            center_coordinate = center_offset.dot(axis)
-            center_radial = center_offset - axis * center_coordinate
-            if (
-                center_radial.length > 1.0e-9
-                and radial_normal.dot(center_radial) < 0.0
-            ):
-                radial_normal.negate()
-            radial_normal.normalize()
-            angles.append(
-                math.atan2(
-                    radial_normal.dot(fit["basis_y"]),
-                    radial_normal.dot(fit["basis_x"]),
-                ) % math.tau
-            )
-        angles.sort()
-        unique = []
-        tolerance = 1.0e-5
-        for angle in angles:
-            if not unique or angle - unique[-1] > tolerance:
-                unique.append(angle)
-        if (
-            len(unique) > 1
-            and unique[0] + math.tau - unique[-1] <= tolerance
-        ):
-            unique.pop()
-        if len(unique) < 3:
-            return max(3, min(512, len(getattr(self, "_locked_indices", ())) or 32))
-        gaps = [
-            (unique[(index + 1) % len(unique)] - angle) % math.tau
-            for index, angle in enumerate(unique)
-        ]
-        ordinary_gap = float(np.median([gap for gap in gaps if gap > tolerance]))
-        if ordinary_gap <= tolerance:
-            return max(3, min(512, len(unique)))
-        return max(3, min(512, round(math.tau / ordinary_gap)))
-
-    def _fit_reconstruction_depth(self):
-        """Measure blind depth between axis intersections with fitted surfaces."""
-        if self._fit.get("is_stud", False):
-            return None
-        fit = self._fit
-        axis = fit["axis"].normalized()
-        center = fit["center"]
-        unique_surfaces = list({
-            id(surface): surface
-            for surface in self._resize_surfaces_by_vertex.values()
-        }.values())
-
-        def intersection_coordinate(surface):
-            points = surface.get("loop_world_points", ())
-            if not points:
-                return None
-            reference = sum(
-                points, Vector((0.0, 0.0, 0.0))
-            ) / len(points)
-            reference_coordinate = (reference - center).dot(axis)
-            axis_point = center + axis * reference_coordinate
-            if surface["hypothesis"].get("method") == "ORGANIC":
-                intersection = GeometryMixin._project_bvh_along_axis(
-                    surface.get("organic_bvh"),
-                    surface.get("organic_span", 0.0),
-                    axis_point,
-                    reference,
-                    axis,
-                )
-            else:
-                intersection = GeometryMixin._project_hypothesis_along_axis(
-                    surface["hypothesis"],
-                    axis_point,
-                    reference,
-                    axis,
-                )
-            if intersection is None:
-                return None
-            return (intersection - center).dot(axis)
-
-        exterior = [
-            value
-            for surface in unique_surfaces
-            if surface["closed"] and surface["exterior"]
-            for value in (intersection_coordinate(surface),)
-            if value is not None
-        ]
-        interior = [
-            value
-            for surface in unique_surfaces
-            if surface["closed"] and not surface["exterior"]
-            for value in (intersection_coordinate(surface),)
-            if value is not None
-        ]
-        if not exterior or not interior:
-            return None
-        initial, outer, inner = max(
-            (abs(inner - outer), outer, inner)
-            for outer in exterior
-            for inner in interior
-        )
-        if initial <= max(float(fit["radius"]) * 1.0e-6, 1.0e-9):
-            return None
-        return {
-            "initial": initial,
-            "outer_coordinate": outer,
-            "inner_coordinate": inner,
-            "outer_plane_index": -1,
-            "inner_plane_index": -1,
-            "is_stud": False,
-            "parallel": False,
-            "surface_depth": True,
-        }
-
-    def _build_virtual_organic_surface(
-        self, bm, selected_faces, loop_verts, loop_edges
-    ):
-        """Fair a temporary wall-free mesh and retain only its patch BVH."""
-        copied = bm.copy()
-        try:
-            copied.verts.ensure_lookup_table()
-            copied.edges.ensure_lookup_table()
-            copied.faces.ensure_lookup_table()
-            copied_loop_verts = [copied.verts[vert.index] for vert in loop_verts]
-            copied_loop_edges = [copied.edges[edge.index] for edge in loop_edges]
-            copied_selected = [
-                copied.faces[face.index] for face in selected_faces
-            ]
-            bmesh.ops.delete(
-                copied, geom=copied_selected, context='FACES'
-            )
-            if any(
-                not edge.is_valid or len(edge.link_faces) != 1
-                for edge in copied_loop_edges
-            ):
-                return None, 0.0
-            result = fair_boundary_loop(
-                copied,
-                copied_loop_verts,
-                copied_loop_edges,
-                self._object.matrix_world,
-                {"method": "ORGANIC", "residual": 0.0},
-            )
-            return GeometryMixin._surface_bvh(
-                result["faces"], self._object.matrix_world
-            )
-        except (FairingError, IndexError, ValueError, np.linalg.LinAlgError):
-            return None, 0.0
-        finally:
-            copied.free()
-
-    @staticmethod
-    def _project_bvh_along_axis(bvh, span, point, reference, axis):
-        """Return the closest bidirectional axis-ray hit to ``reference``."""
-        hit = GeometryMixin._project_bvh_hit_along_axis(
-            bvh, span, point, reference, axis
-        )
-        return hit[0] if hit is not None else None
-
-    @staticmethod
-    def _project_bvh_hit_along_axis(bvh, span, point, reference, axis):
-        """Return the closest axis-ray hit and normal to ``reference``."""
-        if bvh is None:
-            return None
-        axis = axis.normalized()
-        epsilon = max(span * 1.0e-7, 1.0e-8)
-        candidates = []
-        nearest = bvh.find_nearest(point)
-        if nearest and nearest[0] is not None:
-            location = nearest[0]
-            delta = location - point
-            perpendicular = delta - axis * delta.dot(axis)
-            if perpendicular.length <= epsilon * 4.0:
-                candidates.append((location, nearest[1]))
-        for direction in (axis, -axis):
-            hit = bvh.ray_cast(
-                point + direction * epsilon,
-                direction,
-                span,
-            )
-            if hit[0] is not None:
-                candidates.append((hit[0], hit[1]))
-        if not candidates:
-            return None
-        return min(
-            candidates,
-            key=lambda candidate: (candidate[0] - reference).length,
-        )
-
-    def _enlargement_reaches_nonplanar_support(self):
-        """Detect a target rim that grows beyond its original planar collar."""
-        if GeometryMixin._target_scale(self) <= 1.0 + 1.0e-9:
-            return False
-        bvh = getattr(self, "_resize_base_bvh", None)
-        span = getattr(self, "_resize_base_span", 0.0)
-        if bvh is None:
-            return False
-        fit = self._fit
-        axis = fit["axis"].normalized()
-        # This is a mode switch, not a precision surface measurement. Allow
-        # ordinary mesh noise and triangulation-normal variation to remain in
-        # the direct one-plane path; the initial hypothesis has already
-        # established that the collar itself is planar.
-        tolerance = max(span * 5.0e-4, fit["radius"] * 1.0e-3, 1.0e-6)
-        normal_alignment = math.cos(math.radians(2.0))
-        unique_surfaces = {
-            id(surface): surface
-            for surface in getattr(
-                self, "_resize_surfaces_by_vertex", {}
-            ).values()
-        }.values()
-        for surface in unique_surfaces:
-            hypothesis = surface.get("hypothesis", {})
-            planes = hypothesis.get("planes", ())
-            if (
-                not surface.get("exterior")
-                or not surface.get("closed")
-                or hypothesis.get("method") != "PLANES"
-                or len(planes) != 1
-            ):
-                continue
-            plane = planes[0]
-            plane_normal = plane["normal"].normalized()
-            tested = 0
-            nonplanar = 0
-            for point in surface.get("loop_world_points", ()):
-                offset = point - fit["center"]
-                coordinate = offset.dot(axis)
-                radial = offset - axis * coordinate
-                if radial.length_squared <= 1.0e-16:
-                    continue
-                source_radius = GeometryMixin._fitted_radius_at(
-                    self, coordinate
-                )
-                target_radius = GeometryMixin._target_radius_at(
-                    self, coordinate
-                )
-                if target_radius <= source_radius + tolerance:
-                    continue
-                tested += 1
-                probe = (
-                    fit["center"]
-                    + axis * coordinate
-                    + radial.normalized() * target_radius
-                )
-                hit = GeometryMixin._project_bvh_hit_along_axis(
-                    bvh, span, probe, point, axis
-                )
-                if hit is None:
-                    nonplanar += 1
-                    continue
-                location, normal = hit
-                plane_error = abs(
-                    plane_normal.dot(location - plane["point"])
-                )
-                if plane_error > tolerance:
-                    nonplanar += 1
-                elif (
-                    normal is not None
-                    and normal.length_squared > 1.0e-16
-                    and abs(normal.normalized().dot(plane_normal))
-                    < normal_alignment
-                ):
-                    nonplanar += 1
-            required = 1 if tested == 1 else max(2, math.ceil(tested * 0.1))
-            if nonplanar >= required:
-                return True
-        return False
-
-    @staticmethod
-    def _project_hypothesis_along_axis(hypothesis, point, reference, axis):
-        """Intersect an axis line with a virtual plane/sphere/conic surface."""
-        method = hypothesis.get("method")
-        axis = axis.normalized()
-        candidates = []
-        if method == "PLANES":
-            for plane in hypothesis["planes"]:
-                denominator = plane["normal"].dot(axis)
-                if abs(denominator) <= 1.0e-9:
-                    continue
-                distance = plane["normal"].dot(
-                    plane["point"] - point
-                ) / denominator
-                candidates.append(point + axis * distance)
-        elif method == "SPHERE":
-            relative = point - hypothesis["center"]
-            linear = relative.dot(axis)
-            constant = relative.length_squared - hypothesis["radius"] ** 2
-            discriminant = linear * linear - constant
-            tolerance = max(
-                (linear * linear + abs(constant)) * 1.0e-10,
-                1.0e-12,
-            )
-            if discriminant >= -tolerance:
-                root = math.sqrt(max(0.0, discriminant))
-                candidates.extend((
-                    point + axis * (-linear - root),
-                    point + axis * (-linear + root),
-                ))
-        elif method == "CONIC":
-            fit = hypothesis["fit"]
-            surface_axis = fit["axis"].normalized()
-            relative = point - fit["center"]
-            axial = relative.dot(surface_axis)
-            ray_axial = axis.dot(surface_axis)
-            radial = relative - surface_axis * axial
-            ray_radial = axis - surface_axis * ray_axial
-            slope = float(fit.get("slope", 0.0))
-            radius = float(fit["radius"]) + slope * axial
-            radius_rate = slope * ray_axial
-            quadratic = ray_radial.length_squared - radius_rate * radius_rate
-            linear = 2.0 * (
-                radial.dot(ray_radial) - radius * radius_rate
-            )
-            constant = radial.length_squared - radius * radius
-            if abs(quadratic) <= 1.0e-12:
-                if abs(linear) > 1.0e-12:
-                    candidates.append(point + axis * (-constant / linear))
-            else:
-                discriminant = linear * linear - 4.0 * quadratic * constant
-                tolerance = max(
-                    (
-                        linear * linear
-                        + abs(4.0 * quadratic * constant)
-                    ) * 1.0e-10,
-                    1.0e-12,
-                )
-                if discriminant >= -tolerance:
-                    root = math.sqrt(max(0.0, discriminant))
-                    candidates.extend((
-                        point + axis * ((-linear - root) / (2.0 * quadratic)),
-                        point + axis * ((-linear + root) / (2.0 * quadratic)),
-                    ))
-        if not candidates:
-            return None
-        return min(candidates, key=lambda candidate: (candidate - reference).length)
 
     def _boolean_cutter_geometry(
         self, obj, blind_coordinates=None, segment_override=None
     ):
         """Return local cutter vertices/faces for the requested hole dimensions."""
+        self._boolean_bore_projection = None
         fit = self._fit
         axis = fit["axis"].normalized()
+        segments = GeometryMixin._boolean_segment_count(self, segment_override)
         depth_fit = getattr(self, "_depth_fit", None)
         world_vertices = [obj.matrix_world @ vert.co for vert in obj.data.vertices]
         if not world_vertices:
@@ -1481,12 +236,19 @@ class GeometryMixin:
         axial_bounds = [
             (point - fit["center"]).dot(axis) for point in world_vertices
         ]
-        span = max(max(axial_bounds) - min(axial_bounds), fit["radius"], 1.0e-6)
+        bore_min = min(float(fit["z_min"]), float(fit["z_max"]))
+        bore_max = max(float(fit["z_min"]), float(fit["z_max"]))
+        span = max(bore_max - bore_min, fit["radius"], 1.0e-6)
         # Keep the cutter cap comfortably outside the reconstructed exterior.
         # Exact Boolean is much less reliable when the cap is coplanar with, or
         # only microscopically beyond, a large planar support face.
+        outer_coordinate = (
+            depth_fit["outer_coordinate"]
+            if depth_fit
+            else GeometryMixin._radius_coordinate(self)
+        )
         target_outer_radius = max(
-            abs(float(getattr(self, "diameter", fit["radius"] * 2.0))) * 0.5,
+            GeometryMixin._boolean_radius_at(self, outer_coordinate, segments),
             float(fit["radius"]),
         )
         margin = max(
@@ -1500,28 +262,113 @@ class GeometryMixin:
                 depth_fit["inner_coordinate"] - outer
             ) * GeometryMixin._target_depth_scale(self)
             direction = 1.0 if inner >= outer else -1.0
-            coordinates = (outer - direction * margin, inner)
+            coordinates = [outer - direction * margin, inner]
+            exit_coordinates = getattr(self, "_conic_exit_coordinates", None)
+            if exit_coordinates is not None and GeometryMixin._uses_conic_dimensions(self):
+                # Only reach the original exit, not remote geometry elsewhere
+                # on the same axis. Continue at the fixed truncation radius.
+                continuation_end = (
+                    max(exit_coordinates) + margin if direction > 0.0
+                    else min(exit_coordinates) - margin
+                )
+                if (continuation_end - inner) * direction > 1.0e-9:
+                    coordinates.append(continuation_end)
+            elif GeometryMixin._conic_continues_as_cylindrical_bore(self):
+                continuation_end = (
+                    max(axial_bounds) + margin
+                    if direction > 0.0
+                    else min(axial_bounds) - margin
+                )
+                if (continuation_end - inner) * direction > 1.0e-9:
+                    coordinates.append(continuation_end)
         elif blind_coordinates is not None:
             outer, inner = blind_coordinates
             direction = 1.0 if inner >= outer else -1.0
-            coordinates = (outer - direction * margin, inner)
+            coordinates = [outer - direction * margin, inner]
         else:
-            coordinates = (
-                min(axial_bounds) - margin,
-                max(axial_bounds) + margin,
-            )
+            mouth_coordinates = []
+            for surface in {
+                id(surface): surface
+                for surface in getattr(
+                    self, "_resize_surfaces_by_vertex", {}
+                ).values()
+            }.values():
+                if not surface.get("exterior") or not surface.get("closed"):
+                    continue
+                hypothesis = surface.get("hypothesis", {})
+                for point in surface.get("loop_world_points", ()):
+                    offset = point - fit["center"]
+                    coordinate = offset.dot(axis)
+                    radial = offset - axis * coordinate
+                    if radial.length_squared <= 1.0e-16:
+                        continue
+                    probe = (
+                        fit["center"]
+                        + axis * coordinate
+                        + radial.normalized()
+                        * GeometryMixin._boolean_radius_at(self, coordinate, segments)
+                    )
+                    projected = GeometryMixin._project_hypothesis_along_axis(
+                        hypothesis, probe, point, axis
+                    )
+                    if projected is not None:
+                        mouth_coordinates.append(
+                            (projected - fit["center"]).dot(axis)
+                        )
+            if mouth_coordinates:
+                bore_min = min(bore_min, min(mouth_coordinates))
+                bore_max = max(bore_max, max(mouth_coordinates))
+            # A through-hole cutter only needs to cross the two detected bore
+            # mouths. Extending it across the complete object can cut a second,
+            # remote part of a bracket that happens to lie on the same axis.
+            coordinates = [
+                bore_min - margin,
+                bore_max + margin,
+            ]
 
-        segments = max(3, min(512, int(
-            segment_override
-            or getattr(self, "boolean_segments", 0)
-            or getattr(self, "_resize_angular_segments", 0)
-            or len(self._locked_indices)
-            or 32
-        )))
+        if getattr(self, "_boolean_preserved_bore", None) is not None:
+            return GeometryMixin._preserved_bore_cutter_geometry(
+                self, obj, segments, coordinates[0]
+            )
         inverse = obj.matrix_world.inverted_safe()
         vertices = []
-        for coordinate in coordinates:
-            radius = GeometryMixin._target_radius_at(self, coordinate)
+        radii = [
+            GeometryMixin._boolean_radius_at(self, coordinate, segments)
+            for coordinate in coordinates[:2]
+        ]
+        if len(coordinates) > 2:
+            # A countersink's cone ends at the requested truncation circle, but
+            # its normal center bore continues at that circle's radius. Give
+            # the complete junction and continuation temporary radial clearance
+            # so no exact-radius ring is coplanar with the wall left by a prior
+            # resize. The final result is projected back to the fitted radius.
+            # The existing through-bore is commonly only approximately
+            # cylindrical (and may already contain Boolean tessellation).
+            # A microscopic offset can therefore still run through portions
+            # of its old wall and Exact Boolean preserves overlapping faces.
+            # Use enough temporary clearance to envelop that variation; the
+            # generated wall is restored to ``radii[1]`` after subtraction.
+            exact_bore_radius = radii[1]
+            bore_clearance = max(
+                exact_bore_radius
+                * float(
+                    getattr(self, "_conic_bore_clearance_ratio", 1.0e-4)
+                ),
+                1.0e-6,
+            )
+            expanded_bore_radius = exact_bore_radius + bore_clearance
+            radii[1] = expanded_bore_radius
+            radii.extend(
+                [expanded_bore_radius] * (len(coordinates) - 2)
+            )
+            self._boolean_bore_projection = {
+                "inner_coordinate": coordinates[1],
+                "end_coordinate": coordinates[-1],
+                "radius": exact_bore_radius,
+                "expanded_radius": expanded_bore_radius,
+                "segments": segments,
+            }
+        for coordinate, radius in zip(coordinates, radii):
             for index in range(segments):
                 angle = math.tau * index / segments
                 radial = (
@@ -1535,59 +382,190 @@ class GeometryMixin:
                 )
 
         faces = []
-        for index in range(segments):
-            following = (index + 1) % segments
-            faces.append((
-                index,
-                following,
-                segments + following,
-                segments + index,
-            ))
+        for ring_index in range(len(coordinates) - 1):
+            start = ring_index * segments
+            following_start = start + segments
+            for index in range(segments):
+                following = (index + 1) % segments
+                faces.append((
+                    start + index,
+                    start + following,
+                    following_start + following,
+                    following_start + index,
+                ))
         faces.append(tuple(reversed(range(segments))))
-        faces.append(tuple(range(segments, segments * 2)))
+        last_start = (len(coordinates) - 1) * segments
+        faces.append(tuple(range(last_start, last_start + segments)))
         if coordinates[1] < coordinates[0]:
             faces = [tuple(reversed(face)) for face in faces]
         return vertices, faces
 
-    def _cleanup_shrunk_boolean(self, obj, cutter_vertices, cutter_faces):
-        """Dissolve Boolean splits around a newly inset, smaller hole."""
-        cutter_bvh = BVHTree.FromPolygons(
-            cutter_vertices, cutter_faces, all_triangles=False
-        )
+
+    def _cleanup_faired_boolean_surface(
+        self,
+        obj,
+        cutter_vertices,
+        cutter_faces,
+        fair_materials,
+        simplify=True,
+    ):
+        """Simplify the tagged fair surface without touching cutter faces."""
         if obj.mode != 'EDIT':
             bpy.ops.object.mode_set(mode='EDIT')
         bm = bmesh.from_edit_mesh(obj.data)
         bm.faces.ensure_lookup_table()
-        minimum = Vector((
-            min(vert.x for vert in cutter_vertices),
-            min(vert.y for vert in cutter_vertices),
-            min(vert.z for vert in cutter_vertices),
-        ))
-        maximum = Vector((
-            max(vert.x for vert in cutter_vertices),
-            max(vert.y for vert in cutter_vertices),
-            max(vert.z for vert in cutter_vertices),
-        ))
-        scale = max((maximum - minimum).length, 1.0)
-        tolerance = max(scale * 1.0e-5, 1.0e-7)
-        inset_faces = set()
-        for face in bm.faces:
-            nearest = cutter_bvh.find_nearest(face.calc_center_median())
-            if nearest is not None and nearest[0] is not None:
-                if nearest[3] <= tolerance:
-                    inset_faces.add(face)
-        if not inset_faces:
-            return
-        result = expanded_limited_dissolve(bm, inset_faces)
-        for face in bm.faces:
-            face.select = False
-        for face in result["faces"]:
-            if face.is_valid:
-                face.select = True
-        bm.normal_update()
-        bmesh.update_edit_mesh(
-            obj.data, loop_triangles=True, destructive=True
+        fair_materials = dict(fair_materials)
+        tagged_faces = {
+            face for face in bm.faces
+            if face.is_valid and not face.hide and face.material_index in fair_materials
+        }
+        world_cutter_vertices = [
+            obj.matrix_world @ point for point in cutter_vertices
+        ]
+        cutter_bvh = BVHTree.FromPolygons(
+            world_cutter_vertices, cutter_faces, all_triangles=False
         )
+        if world_cutter_vertices:
+            minimum = Vector(tuple(
+                min(point[axis] for point in world_cutter_vertices)
+                for axis in range(3)
+            ))
+            maximum = Vector(tuple(
+                max(point[axis] for point in world_cutter_vertices)
+                for axis in range(3)
+            ))
+            tolerance = max((maximum - minimum).length * 1.0e-5, 1.0e-7)
+        else:
+            tolerance = 1.0e-7
+
+        def lies_on_cutter(face):
+            points = [obj.matrix_world @ vert.co for vert in face.verts]
+            points.append(obj.matrix_world @ face.calc_center_median())
+            return all(
+                (nearest := cutter_bvh.find_nearest(point)) is not None
+                and nearest[0] is not None
+                and nearest[3] <= tolerance
+                for point in points
+            )
+
+        # Generic face attributes are interpolated by the Boolean. Newly made
+        # cutter-wall/cap faces can therefore inherit the fair tag even though
+        # they are not part of the reconstructed support surface.
+        boolean_cutter_faces = {
+            face for face in bm.faces if face.is_valid and not face.hide and lies_on_cutter(face)
+        }
+        fair_faces = tagged_faces - boolean_cutter_faces
+
+        def restore_materials_and_slots():
+            current_bm = bmesh.from_edit_mesh(obj.data)
+            for face in current_bm.faces:
+                restore_index = fair_materials.get(face.material_index)
+                if restore_index is not None:
+                    face.material_index = restore_index
+            bmesh.update_edit_mesh(
+                obj.data, loop_triangles=False, destructive=False
+            )
+            for material_index in sorted(fair_materials, reverse=True):
+                if material_index < len(obj.data.materials):
+                    obj.data.materials.pop(index=material_index)
+
+        if not simplify or not fair_faces:
+            restore_materials_and_slots()
+            return bool(fair_faces)
+
+        previous_select_mode = tuple(
+            bpy.context.tool_settings.mesh_select_mode
+        )
+        try:
+            bpy.ops.mesh.select_mode(
+                use_extend=False, use_expand=False, type='FACE'
+            )
+            for face in bm.faces:
+                face.select = False
+            for face in fair_faces:
+                if face.is_valid:
+                    face.select = True
+            bm.select_flush_mode()
+            bmesh.update_edit_mesh(
+                obj.data, loop_triangles=False, destructive=False
+            )
+            # The final region is exactly the complete reconstructed/fair
+            # surface and one topological face ring on its exterior side.
+            bpy.ops.mesh.select_more(use_face_step=True)
+            bm = bmesh.from_edit_mesh(obj.data)
+            for face in boolean_cutter_faces:
+                if face.is_valid:
+                    face.select = False
+            bm.select_flush_mode()
+            bmesh.update_edit_mesh(
+                obj.data, loop_triangles=False, destructive=False
+            )
+            # Convert that face region to edge selection immediately before
+            # simplification so the old outer seam participates.
+            bpy.ops.mesh.select_mode(
+                use_extend=False, use_expand=False, type='EDGE'
+            )
+            bm = bmesh.from_edit_mesh(obj.data)
+            fit = self._fit
+            axis = fit["axis"].normalized()
+            center = fit["center"]
+            cutter_offsets = [point - center for point in world_cutter_vertices]
+            cutter_coordinates = [
+                offset.dot(axis) for offset in cutter_offsets
+            ]
+            cutter_radius = max(
+                (
+                    offset - axis * coordinate
+                ).length
+                for offset, coordinate in zip(
+                    cutter_offsets, cutter_coordinates
+                )
+            )
+            local_radius = max(cutter_radius, float(fit["radius"]))
+            local_padding = max(local_radius * 0.25, tolerance * 10.0)
+
+            def edge_is_local(edge):
+                for vert in edge.verts:
+                    offset = obj.matrix_world @ vert.co - center
+                    coordinate = offset.dot(axis)
+                    radial = offset - axis * coordinate
+                    if (
+                        radial.length > local_radius + local_padding
+                        or coordinate
+                        < min(cutter_coordinates) - local_padding
+                        or coordinate
+                        > max(cutter_coordinates) + local_padding
+                    ):
+                        return False
+                return True
+
+            # A topological one-face expansion can include an enormous planar
+            # triangle whose far vertex belongs to another part of the model.
+            # Keep the former rim and nearby Boolean spokes, but never let the
+            # dissolve propagate along those non-local support edges.
+            for edge in bm.edges:
+                if edge.select and not edge_is_local(edge):
+                    edge.select = False
+            bmesh.update_edit_mesh(
+                obj.data, loop_triangles=False, destructive=False
+            )
+            bpy.ops.mesh.dissolve_limited(
+                angle_limit=LIMITED_DISSOLVE_ANGLE,
+                # The former hole rim is now the seam between the fair patch
+                # and its selected outer ring. Boundary-inclusive dissolve is
+                # required to remove those redundant rim vertices/spokes.
+                use_dissolve_boundaries=True,
+                # Boolean evaluation can leave split loop normals on every
+                # coplanar fairing subdivision. NORMAL delimiting would retain
+                # that data seam as the visible radial/concentric spider web.
+                # The region and new opening are already explicitly bounded;
+                # use geometric angle alone to retain genuine surface breaks.
+                delimit=set(),
+            )
+        finally:
+            bpy.context.tool_settings.mesh_select_mode = previous_select_mode
+        restore_materials_and_slots()
+        return True
 
     @staticmethod
     def _boolean_depth_unchanged(operator, blind_coordinates):
@@ -1595,8 +573,14 @@ class GeometryMixin:
         depth_fit = getattr(operator, "_depth_fit", None)
         if depth_fit is None:
             return blind_coordinates is not None
+        if GeometryMixin._conic_continues_as_cylindrical_bore(operator):
+            return False
         initial = float(depth_fit.get("initial", 0.0))
-        current = float(getattr(operator, "depth", initial))
+        current = float(
+            getattr(operator, "truncated_depth", initial)
+            if GeometryMixin._uses_conic_dimensions(operator)
+            else getattr(operator, "depth", initial)
+        )
         return math.isclose(
             current,
             initial,
@@ -1640,7 +624,7 @@ class GeometryMixin:
         bm.faces.ensure_lookup_table()
 
         def is_base_face(face):
-            if not face.is_valid:
+            if not face.is_valid or face.hide:
                 return False
             world_normal = normal_matrix @ face.normal
             if (
@@ -1676,7 +660,7 @@ class GeometryMixin:
                 edges=list(affected_edges),
                 delimit={'NORMAL'},
             )
-            bm.normal_update()
+            update_visible_normals(bm)
 
         for face in bm.faces:
             face.select = False
@@ -1693,53 +677,161 @@ class GeometryMixin:
         obj = self._object
         if source is None or obj is None:
             return False
+        self._resize_wall_cache = None
         if obj.mode == 'EDIT':
             bpy.ops.object.mode_set(mode='OBJECT')
-        preview_mesh = obj.data
-        obj.data = source if consume else source.copy()
+        GeometryMixin._remove_live_boolean_preview(self)
+        restore_mesh_contents(obj, source)
         if consume:
             self._boolean_preview_source = None
             self._boolean_preview_segments = 0
             self._boolean_preview_last_update = 0.0
             self._boolean_preview_pending = False
-        if preview_mesh is not source and preview_mesh.users == 0:
-            bpy.data.meshes.remove(preview_mesh)
+            reconstruction = getattr(
+                self, "_boolean_reconstruction_source", None
+            )
+            self._boolean_reconstruction_source = None
+            self._boolean_reconstruction_blind_coordinates = None
+            if reconstruction is not None and reconstruction.users == 0:
+                bpy.data.meshes.remove(reconstruction)
+        if consume and source.users == 0:
+            bpy.data.meshes.remove(source)
         bpy.context.view_layer.objects.active = obj
         obj.select_set(True)
         bpy.ops.object.mode_set(mode='EDIT')
-        self._resize_projection_ready = False
-        self._resize_surfaces_by_vertex = {}
-        self._resize_base_bvh = None
+        invalidate_projection(self)
         self._resize_base_span = 0.0
-        self._original_vertex_coords = None
-        self._proportional_weights = None
+        reset_deformation(self)
+        GeometryMixin._release_boolean_fair_materials(self)
         return True
+
+    def _release_boolean_fair_materials(self):
+        """Release only our temporary tags once no operand mesh uses them."""
+        retained = []
+        for material in getattr(self, "_boolean_fair_materials", ()):
+            if material.users == 0:
+                bpy.data.materials.remove(material)
+            else:
+                retained.append(material)
+        self._boolean_fair_materials = retained
 
     def _discard_boolean_preview_source(self):
         """Release the pristine source retained while previewing a Boolean."""
+        self._resize_wall_cache = None
+        GeometryMixin._remove_live_boolean_preview(self)
         source = getattr(self, "_boolean_preview_source", None)
+        reconstruction = getattr(
+            self, "_boolean_reconstruction_source", None
+        )
         self._boolean_preview_source = None
+        self._boolean_reconstruction_source = None
+        self._boolean_reconstruction_blind_coordinates = None
         self._boolean_preview_segments = 0
         self._boolean_preview_last_update = 0.0
         self._boolean_preview_pending = False
+        self._boolean_preserved_bore = None
         if source is not None and source.users == 0:
             bpy.data.meshes.remove(source)
+        if reconstruction is not None and reconstruction.users == 0:
+            bpy.data.meshes.remove(reconstruction)
+        GeometryMixin._release_boolean_fair_materials(self)
+
+    def _remove_live_boolean_preview(self):
+        """Remove the reusable modal cutter and its unevaluated modifier."""
+        obj = getattr(self, "_object", None)
+        self._resize_fair_only_preview = False
+        display_object = getattr(
+            self, "_boolean_preview_display_object", None
+        )
+        self._boolean_preview_display_object = None
+        modifier_name = getattr(self, "_boolean_preview_modifier_name", "")
+        self._boolean_preview_modifier_name = ""
+        modifier_owner = display_object or obj
+        if modifier_owner is not None and modifier_name:
+            try:
+                modifier = modifier_owner.modifiers.get(modifier_name)
+                if modifier is not None:
+                    modifier_owner.modifiers.remove(modifier)
+            except ReferenceError:
+                pass
+        if display_object is not None:
+            try:
+                display_mesh = display_object.data
+                bpy.data.objects.remove(display_object, do_unlink=True)
+                if (
+                    display_mesh is not None
+                    and display_mesh.users == 0
+                    and (obj is None or display_mesh is not obj.data)
+                ):
+                    bpy.data.meshes.remove(display_mesh)
+            except ReferenceError:
+                pass
+        if obj is not None:
+            try:
+                obj.hide_set(False)
+            except ReferenceError:
+                pass
+
+        cutter = getattr(self, "_boolean_preview_cutter_object", None)
+        self._boolean_preview_cutter_object = None
+        if cutter is None:
+            return
+        try:
+            cutter_mesh = cutter.data
+            bpy.data.objects.remove(cutter, do_unlink=True)
+            if cutter_mesh is not None and cutter_mesh.users == 0:
+                bpy.data.meshes.remove(cutter_mesh)
+        except ReferenceError:
+            pass
+
+    def _restore_boolean_reconstruction(self):
+        """Restore the cached fair surface used by repeated live cutters."""
+        self._resize_wall_cache = None
+        source = getattr(self, "_boolean_reconstruction_source", None)
+        obj = self._object
+        if source is None or obj is None:
+            return False
+        if obj.mode == 'EDIT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        restore_mesh_contents(obj, source)
+        bpy.context.view_layer.objects.active = obj
+        obj.select_set(True)
+        return True
+
+    def _live_boolean_segments(self):
+        """Use source resolution through 32 sides, otherwise preview at 32."""
+        detected = max(3, min(512, int(
+            getattr(self, "boolean_segments", 0)
+            or getattr(self, "_resize_angular_segments", 0)
+            or 32
+        )))
+        return detected if detected <= 32 else 32
 
     def _update_boolean_preview(
-        self, context, preview_segments=16, source_is_current=False
+        self, context, preview_segments=None, source_is_current=False,
+        fair_only=False,
     ):
         """Show a reversible, low-resolution Exact Boolean mesh in Edit Mode."""
         obj = context.active_object
+        if preview_segments is None:
+            preview_segments = GeometryMixin._live_boolean_segments(self)
         if getattr(self, "_boolean_preview_source", None) is None:
+            # Edit-mode coordinates live in BMesh, not necessarily obj.data.
+            # A preceding direct resize may have changed only that BMesh;
+            # copying the stale datablock would resurrect the previous hole.
+            obj.update_from_editmode()
             self._boolean_preview_source = obj.data.copy()
         self._boolean_preview_segments = preview_segments
         if not source_is_current:
             GeometryMixin._replace_boolean_preview_with_source(self)
         bm = bmesh.from_edit_mesh(obj.data)
         bm.faces.ensure_lookup_table()
-        selected_faces = [
-            bm.faces[index] for index in sorted(self._locked_indices)
-        ]
+        # Restoring the pristine modal source can change element numbering when
+        # the interaction entered Boolean mode after a direct preview or after
+        # earlier topology edits. Never index that restored BMesh with the
+        # previous mesh's face indices; validate them and rediscover the fitted
+        # wall geometrically when its topology signature no longer matches.
+        selected_faces = GeometryMixin._resolve_resize_wall_faces(self, bm)
         GeometryMixin._build_resize_projection_state(
             self, bm, selected_faces
         )
@@ -1749,14 +841,17 @@ class GeometryMixin:
         GeometryMixin._capture_deformation_state(
             self, context, bm, selected_verts
         )
-        self._resize_dynamic_requires_boolean = True
-        self._resize_requires_boolean = True
+        self._resize_dynamic_requires_boolean = (
+            getattr(self, "resize_method", 'AUTO') == 'AUTO'
+        )
+        GeometryMixin._resolve_resize_method(self)
         GeometryMixin._recreate_hole_with_boolean(
             self,
             context,
             bm,
             selected_faces,
             preview_segments=preview_segments,
+            fair_only=fair_only,
         )
         self._boolean_preview_last_update = time.monotonic()
         self._boolean_preview_pending = False
@@ -1794,7 +889,11 @@ class GeometryMixin:
         interior = [
             value
             for surface in surfaces
-            if surface["closed"] and not surface["exterior"]
+            if (
+                surface["closed"]
+                and not surface["exterior"]
+                and not surface.get("bore_continuation", False)
+            )
             for value in (coordinate(surface),)
             if value is not None
         ]
@@ -1869,17 +968,34 @@ class GeometryMixin:
         return loop_verts, loop_edges
 
     def _recreate_hole_with_boolean(
-        self, context, bm, selected_faces, preview_segments=None
+        self, context, bm, selected_faces, preview_segments=None,
+        fair_only=False,
     ):
-        """Rebuild the old opening, then subtract the requested conic cutter."""
+        """Fair the old cavity, then cut again unless closing with fair_only."""
+        self._resize_wall_cache = None
         obj = context.active_object
-        shrinking = GeometryMixin._target_scale(self) < 1.0 - 1.0e-9
         bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=False)
-        backup = obj.data.copy()
-        cutter_object = None
-        cutter_mesh = None
-        modifier_name = None
+        obj.update_from_editmode()
+        transaction = BooleanTransaction(obj)
+        added_default_material_slot = False
         try:
+            self._boolean_preserved_bore = None
+            preserve_bore = (
+                GeometryMixin._prepare_preserved_boolean_bore(
+                    self, bm, selected_faces,
+                    GeometryMixin._boolean_segment_count(self, preview_segments),
+                ) if not fair_only else None
+            )
+            if fair_only:
+                # Close the complete connected cavity, including a countersink
+                # or its through-bore, rather than leaving a sealed inner shell.
+                continuation_indices = set(getattr(self, "_resize_bore_vertex_indices", ()))
+                continuation_indices.update(getattr(self, "_resize_conic_surfaces_by_vertex", {}))
+                selected_faces = list(set(selected_faces) | {
+                    face for face in bm.faces
+                    if not face.hide and all(vert.index in continuation_indices for vert in face.verts)
+                })
+                GeometryMixin._build_resize_projection_state(self, bm, selected_faces)
             unique_surfaces = list({
                 id(surface): surface
                 for surface in self._resize_surfaces_by_vertex.values()
@@ -1911,13 +1027,20 @@ class GeometryMixin:
             # fairing pass can close the old opening.
             protected_faces = {
                 face
-                for surface in exterior_surfaces
+                for surface in unique_surfaces
+                if (
+                    surface in exterior_surfaces
+                    or surface.get("bore_continuation", False)
+                )
                 for face in surface.get(
                     "support_patch_faces", surface["support_faces"]
                 )
                 if face.is_valid
             }
             blocked_cavity_faces = selected | protected_faces
+            if preserve_bore is not None:
+                protected_faces.update(preserve_bore["faces"])
+                blocked_cavity_faces.update(preserve_bore["faces"])
 
             # A support patch is intentionally shallow because analytic fitting
             # needs only the nearby surface. Deletion needs the opposite: walk
@@ -1928,13 +1051,17 @@ class GeometryMixin:
             cavity_stack = [
                 face
                 for surface in unique_surfaces
-                if not surface["exterior"] and surface["closed"]
+                if (
+                    not surface["exterior"]
+                    and surface["closed"]
+                    and not surface.get("bore_continuation", False)
+                )
                 for face in surface["support_faces"]
-                if face.is_valid and face not in blocked_cavity_faces
+                if face.is_valid and not face.hide and face not in blocked_cavity_faces
             ]
             while cavity_stack:
                 face = cavity_stack.pop()
-                if face in interior_faces or face in blocked_cavity_faces:
+                if face.hide or face in interior_faces or face in blocked_cavity_faces:
                     continue
                 interior_faces.add(face)
                 for edge in face.edges:
@@ -1943,6 +1070,7 @@ class GeometryMixin:
                         for neighbor in edge.link_faces
                         if (
                             neighbor.is_valid
+                            and not neighbor.hide
                             and neighbor not in interior_faces
                             and neighbor not in blocked_cavity_faces
                         )
@@ -1956,7 +1084,7 @@ class GeometryMixin:
             delete_faces = set(selected) | interior_faces
             axial_padding = max(fit["z_max"] - fit["z_min"], 1.0e-6) * 0.02
             for face in bm.faces:
-                if face in selected or face in protected_faces:
+                if face.hide or face in selected or face in protected_faces:
                     continue
                 point = obj.matrix_world @ face.calc_center_median()
                 offset = point - fit["center"]
@@ -1975,15 +1103,38 @@ class GeometryMixin:
             bmesh.ops.delete(
                 bm, geom=list(delete_faces), context='FACES'
             )
-            bm.normal_update()
+            if preserve_bore is not None:
+                GeometryMixin._cap_preserved_boolean_bore(self, bm, preserve_bore)
+            update_visible_normals(bm)
+            fair_materials = {}
             self.reconstruction_result_method = ""
             self.reconstruction_result_fill_style = ""
+            self.reconstruction_grid_edge_length = 0.0
             for surface in exterior_surfaces:
                 loop_verts, loop_edges = (
                     GeometryMixin._recover_reconstruction_rim(
                         bm, surface, obj.matrix_world
                     )
                 )
+                if preserve_bore is not None:
+                    # A preceding Boolean can leave pairs of nearly coincident
+                    # mouth samples. Weld only that recovered boundary before
+                    # filling it; a fan over zero-length edges is degenerate.
+                    tolerance = max(abs(float(fit["radius"])) * 1.0e-6, 1.0e-7)
+                    if any(
+                        (obj.matrix_world @ edge.verts[0].co
+                         - obj.matrix_world @ edge.verts[1].co).length <= tolerance
+                        for edge in loop_edges
+                    ):
+                        local_scale = max(col.length for col in obj.matrix_world.to_3x3().col)
+                        bmesh.ops.remove_doubles(
+                            bm, verts=loop_verts,
+                            dist=tolerance / max(local_scale, 1.0e-12),
+                        )
+                        update_visible_normals(bm)
+                        loop_verts, loop_edges = GeometryMixin._recover_reconstruction_rim(
+                            bm, surface, obj.matrix_world
+                        )
                 hypothesis = surface["hypothesis"]
                 requested_method = getattr(self, "fairing_method", 'AUTO')
                 analytic_faces = [
@@ -2005,74 +1156,127 @@ class GeometryMixin:
                         forced_method=requested_method,
                     )
                 fill_style = getattr(self, "fill_style", 'AUTO')
-                prepared = prepare_fair_boundary(
-                    obj,
-                    bm,
-                    loop_verts,
-                    loop_edges,
-                    hypothesis,
-                    fill_style,
-                )
-                bm = prepared["bm"]
-                loop_verts = prepared["loop_verts"]
-                loop_edges = prepared["loop_edges"]
-                # Preserve the hypothesis accepted from the intact support
-                # patch. A second automatic cascade over only the surviving
-                # post-delete rim can classify the same flat surface
-                # differently and bend a planar reconstruction. Sphere and
-                # cylinder are the exceptions: their boundary-inclusive
-                # dissolve changes the analytic samples, so refit the same
-                # forced model against the surviving support patch.
-                if prepared["forced_method"] is not None:
-                    analytic_faces = [
-                        face
-                        for face in surface.get(
-                            "support_patch_faces", surface["support_faces"]
-                        )
-                        if face.is_valid
-                    ]
-                    hypothesis = choose_hypothesis(
-                        loop_verts,
-                        loop_edges,
-                        obj.matrix_world,
+                def refit_surface(verts, rim, forced_method):
+                    # Keep the accepted model; only analytic pre-dissolve may
+                    # require fresh samples from the surviving support faces.
+                    return choose_hypothesis(
+                        verts, rim, obj.matrix_world,
                         lambda faces: GeometryMixin._fit_cylinder(self, faces),
                         lambda face: GeometryMixin._world_normal(self, face),
-                        analytic_faces=analytic_faces,
-                        forced_method=prepared["forced_method"],
+                        analytic_faces=[face for face in analytic_faces if face.is_valid],
+                        forced_method=forced_method,
                     )
-                result = fair_boundary_loop(
-                    bm,
-                    loop_verts,
-                    loop_edges,
-                    obj.matrix_world,
-                    hypothesis,
-                    fill_style,
-                    circle_loops=getattr(self, "circle_loops", 2),
-                    grid_angle=getattr(self, "grid_angle", 0.0),
-                    direction_samples=prepared["direction_samples"],
-                )
-                self.reconstruction_result_method = result["method"]
-                self.reconstruction_result_fill_style = result["fill_style"]
-                loop_verts = result.get("boundary_verts", loop_verts)
-                loop_edges = result.get("boundary_edges", loop_edges)
-                bm, _result = finalize_fair_patch(
-                    obj,
-                    bm,
-                    result,
-                    loop_verts,
-                    loop_edges,
-                    # This patch is an intermediate Boolean operand. Retain
-                    # its radial/grid subdivisions so Exact Boolean has local
-                    # faces to intersect; shrinking performs the expanded
-                    # limited dissolve on the finished result instead.
-                    final_simplify=False,
-                )
 
-            bm.normal_update()
+                bm, _result = fair_hole_patch(
+                    obj, bm, loop_verts, loop_edges, hypothesis, fill_style,
+                    circle_loops=getattr(self, "circle_loops", 5),
+                    match_curvature=getattr(self, "grid_match_curvature", True),
+                    refit=refit_surface,
+                    # Preserve subdivisions in the Boolean operand; simplify
+                    # the tagged fair surface only after subtraction.
+                    final_simplify=(fair_only and getattr(self, "final_simplify", True)),
+                )
+                self.reconstruction_result_method = _result.get("surface_method", _result["method"])
+                self.reconstruction_result_fill_style = _result["fill_style"]
+                self.reconstruction_grid_edge_length = _result.get("grid_estimated_edge_length", 0.0)
+                support_materials = [
+                    face.material_index
+                    for face in analytic_faces
+                    if face.is_valid
+                ]
+                restore_material = (
+                    max(
+                        set(support_materials),
+                        key=support_materials.count,
+                    )
+                    if support_materials
+                    else 0
+                )
+                if fair_only:
+                    continue
+                if not obj.data.materials:
+                    # Untagged faces already use index zero even with no
+                    # material slots. Reserve it before allocating a fair tag;
+                    # otherwise all source faces masquerade as the fair patch.
+                    obj.data.materials.append(None)
+                    added_default_material_slot = True
+                fair_material_index = len(obj.data.materials)
+                # Empty slots are coalesced by Exact Boolean. Use a distinct
+                # temporary material so source faces never acquire the fair
+                # tag and accidentally enter reconstruction simplification.
+                original_material = obj.data.materials[restore_material]
+                material = (
+                    original_material.copy() if original_material is not None
+                    else bpy.data.materials.new("Holey Tools Fair Surface")
+                )
+                obj.data.materials.append(material)
+                transaction.temporary_materials.append(material)
+                fair_materials[fair_material_index] = restore_material
+                for face in _result["faces"]:
+                    if face.is_valid:
+                        face.material_index = fair_material_index
+
+            update_visible_normals(bm)
+            if preserve_bore is not None:
+                layer = bm.verts.layers.int.get(
+                    self._boolean_preserved_bore["junction_layer_name"]
+                )
+                if layer is None:
+                    raise FairingError("The preserved bore junction lost its topology marker")
+                bm.verts.index_update()
+                self._boolean_preserved_bore["junction_vertices"] = [
+                    (vert.index, obj.matrix_world @ vert.co
+                     - fit["center"] - fit["axis"] * self._boolean_preserved_bore["join"])
+                    for vert in bm.verts if vert[layer]
+                ]
+                bm.verts.layers.int.remove(layer)
             bmesh.update_edit_mesh(
                 obj.data, loop_triangles=True, destructive=True
             )
             bpy.ops.object.mode_set(mode='OBJECT')
+
+            # Native Boolean does not honor Edit Mode hide flags. Its operand
+            # must contain only visible faces; hidden data is restored AFTER
+            # solver cleanup, never sent through the Boolean or dissolve.
+            transaction.hidden_geometry = detach_hidden_geometry(obj)
+            if transaction.hidden_geometry is not None and preserve_bore is not None:
+                self._boolean_preserved_bore["junction_vertices"] = [
+                    (transaction.hidden_geometry.vertex_map[index], radial)
+                    for index, radial in self._boolean_preserved_bore["junction_vertices"]
+                    if index in transaction.hidden_geometry.vertex_map
+                ]
+
+            if fair_only:
+                if preview_segments is not None:
+                    transaction.preview_object = bpy.data.objects.new("Holey Tools Fair Preview", obj.data.copy())
+                    context.collection.objects.link(transaction.preview_object)
+                    transaction.preview_object.matrix_world = obj.matrix_world.copy()
+                    transaction.preview_object.hide_render = True
+                    transaction.preview_object.select_set(False)
+                    restore_mesh_contents(obj, self._boolean_preview_source)
+                elif transaction.hidden_geometry is not None:
+                    transaction.hidden_geometry.restore(obj)
+                bpy.ops.object.mode_set(mode='EDIT')
+                if preview_segments is not None:
+                    obj.hide_set(True)
+                    self._boolean_preview_display_object = transaction.preview_object
+                    transaction.release_preview()
+                    self._resize_fair_only_preview = True
+                self._resize_projection_ready = False
+                return
+
+            if (
+                preview_segments is not None
+                and getattr(
+                    self, "_boolean_reconstruction_source", None
+                ) is None
+            ):
+                self._boolean_reconstruction_source = obj.data.copy()
+                self._boolean_reconstruction_blind_coordinates = (
+                    tuple(blind_coordinates)
+                    if blind_coordinates is not None
+                    else None
+                )
 
             cutter_vertices, cutter_faces = (
                 GeometryMixin._boolean_cutter_geometry(
@@ -2082,6 +1286,167 @@ class GeometryMixin:
                     segment_override=preview_segments,
                 )
             )
+            transaction.cutter_mesh = bpy.data.meshes.new("Holey Tools Boolean Cutter")
+            transaction.cutter_mesh.from_pydata(cutter_vertices, [], cutter_faces)
+            transaction.cutter_mesh.validate(verbose=False)
+            transaction.cutter_mesh.update()
+            transaction.cutter_object = bpy.data.objects.new(
+                "Holey Tools Boolean Cutter", transaction.cutter_mesh
+            )
+            context.collection.objects.link(transaction.cutter_object)
+            transaction.cutter_object.matrix_world = obj.matrix_world.copy()
+            transaction.cutter_object.display_type = 'WIRE'
+            transaction.cutter_object.hide_render = True
+            transaction.cutter_object.select_set(False)
+
+            context.view_layer.objects.active = obj
+            obj.select_set(True)
+            transaction.modifier_owner = obj
+            if preview_segments is not None:
+                transaction.preview_object = bpy.data.objects.new(
+                    "Holey Tools Boolean Preview", obj.data.copy()
+                )
+                context.collection.objects.link(transaction.preview_object)
+                transaction.preview_object.matrix_world = obj.matrix_world.copy()
+                transaction.preview_object.display_type = 'SOLID'
+                transaction.preview_object.hide_render = True
+                transaction.preview_object.select_set(False)
+                transaction.modifier_owner = transaction.preview_object
+            modifier = transaction.modifier_owner.modifiers.new(
+                name="Holey Tools Recreate Hole", type='BOOLEAN'
+            )
+            transaction.modifier_name = modifier.name
+            modifier.operation = 'DIFFERENCE'
+            modifier.solver = 'EXACT'
+            modifier.object = transaction.cutter_object
+            if preview_segments is not None:
+                # Keep the modal result non-destructive. Exact Boolean evaluation
+                # still occurs in the viewport, but dragging only changes this
+                # cutter mesh instead of repeatedly applying a modifier and
+                # replacing the edited object's mesh datablock.
+                modifier.show_viewport = True
+                modifier.show_in_editmode = True
+                modifier.show_on_cage = False
+                transaction.cutter_object.hide_set(True)
+                pristine_source = getattr(
+                    self, "_boolean_preview_source", None
+                )
+                if pristine_source is None:
+                    raise FairingError(
+                        "Boolean preview lost its pristine source mesh"
+                    )
+                # The evaluated Boolean belongs exclusively to the display
+                # object. Put an untouched source copy back on the real edit
+                # object before returning to modal interaction so Blender's
+                # undo/redo input can never become the reconstructed cap.
+                restore_mesh_contents(obj, pristine_source)
+                context.view_layer.objects.active = obj
+                obj.select_set(True)
+                bpy.ops.object.mode_set(mode='EDIT')
+                obj.hide_set(True)
+                self._boolean_preview_display_object = transaction.preview_object
+                self._boolean_preview_cutter_object = transaction.cutter_object
+                self._boolean_preview_modifier_name = modifier.name
+                self._boolean_fair_materials = (
+                    list(getattr(self, "_boolean_fair_materials", ()))
+                    + transaction.temporary_materials
+                )
+                transaction.release_preview()
+                invalidate_projection(self)
+                return
+            bpy.ops.object.modifier_apply(modifier=modifier.name)
+            transaction.modifier_name = None
+            if preview_segments is None:
+                GeometryMixin._restore_boolean_bore_radius(self, obj)
+                final_simplify = getattr(self, "final_simplify", True)
+                GeometryMixin._cleanup_faired_boolean_surface(
+                    self,
+                    obj,
+                    cutter_vertices,
+                    cutter_faces,
+                    fair_materials,
+                    simplify=final_simplify,
+                )
+                if final_simplify and GeometryMixin._boolean_depth_unchanged(
+                    self, blind_coordinates
+                ):
+                    GeometryMixin._cleanup_unchanged_boolean_base(
+                        self, obj, cutter_vertices
+                    )
+                if added_default_material_slot:
+                    obj.data.materials.pop(index=0)
+                if transaction.hidden_geometry is not None:
+                    if obj.mode == 'EDIT':
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    transaction.hidden_geometry.restore(obj)
+            if obj.mode != 'EDIT':
+                bpy.ops.object.mode_set(mode='EDIT')
+            invalidate_projection(self)
+            return
+        except Exception as error:
+            transaction.rollback()
+            self._resize_projection_ready = False
+            if isinstance(error, FairingError):
+                raise
+            raise FairingError(f"Boolean hole reconstruction failed: {error}") from error
+        finally:
+            transaction.close()
+
+    def _apply_cached_boolean_preview(self, context, preview_segments):
+        """Update the reusable cutter over the already-faired preview base."""
+        obj = self._object
+        display_object = getattr(
+            self, "_boolean_preview_display_object", None
+        )
+        cutter_object = getattr(
+            self, "_boolean_preview_cutter_object", None
+        )
+        modifier_name = getattr(self, "_boolean_preview_modifier_name", "")
+        modifier = (
+            display_object.modifiers.get(modifier_name)
+            if display_object is not None and modifier_name
+            else None
+        )
+        if (
+            display_object is None
+            or cutter_object is None
+            or modifier is None
+        ):
+            GeometryMixin._remove_live_boolean_preview(self)
+            if not GeometryMixin._restore_boolean_reconstruction(self):
+                return False
+            obj = self._object
+            display_object = None
+            cutter_object = None
+            modifier = None
+
+        if not GeometryMixin._update_preserved_bore_preview(
+            self, display_object or obj, preview_segments
+        ):
+            # A deeper edit consumed the next source row: reclassify from the
+            # pristine input instead of folding the retained cylinder over it.
+            GeometryMixin._replace_boolean_preview_with_source(self, consume=True)
+            GeometryMixin._update_boolean_preview(self, context, preview_segments,
+                                                  source_is_current=True)
+            return True
+
+        blind_coordinates = getattr(
+            self, "_boolean_reconstruction_blind_coordinates", None
+        )
+        cutter_vertices, cutter_faces = GeometryMixin._boolean_cutter_geometry(
+            self,
+            obj,
+            blind_coordinates,
+            segment_override=preview_segments,
+        )
+        if cutter_object is not None and modifier is not None:
+            cutter_mesh = cutter_object.data
+            cutter_mesh.clear_geometry()
+            cutter_mesh.from_pydata(cutter_vertices, [], cutter_faces)
+            cutter_mesh.validate(verbose=False)
+            cutter_mesh.update()
+            cutter_object.matrix_world = obj.matrix_world.copy()
+        else:
             cutter_mesh = bpy.data.meshes.new("Holey Tools Boolean Cutter")
             cutter_mesh.from_pydata(cutter_vertices, [], cutter_faces)
             cutter_mesh.validate(verbose=False)
@@ -2093,70 +1458,75 @@ class GeometryMixin:
             cutter_object.matrix_world = obj.matrix_world.copy()
             cutter_object.display_type = 'WIRE'
             cutter_object.hide_render = True
+            cutter_object.hide_set(True)
             cutter_object.select_set(False)
-
             context.view_layer.objects.active = obj
             obj.select_set(True)
-            modifier = obj.modifiers.new(
+            display_object = bpy.data.objects.new(
+                "Holey Tools Boolean Preview", obj.data.copy()
+            )
+            context.collection.objects.link(display_object)
+            display_object.matrix_world = obj.matrix_world.copy()
+            display_object.display_type = 'SOLID'
+            display_object.hide_render = True
+            display_object.select_set(False)
+            modifier = display_object.modifiers.new(
                 name="Holey Tools Recreate Hole", type='BOOLEAN'
             )
-            modifier_name = modifier.name
             modifier.operation = 'DIFFERENCE'
             modifier.solver = 'EXACT'
             modifier.object = cutter_object
-            bpy.ops.object.modifier_apply(modifier=modifier.name)
-            modifier_name = None
-            if getattr(self, "final_simplify", True):
-                if shrinking:
-                    GeometryMixin._cleanup_shrunk_boolean(
-                        self, obj, cutter_vertices, cutter_faces
-                    )
-                if GeometryMixin._boolean_depth_unchanged(
-                    self, blind_coordinates
-                ):
-                    GeometryMixin._cleanup_unchanged_boolean_base(
-                        self, obj, cutter_vertices
-                    )
-            bpy.data.objects.remove(cutter_object, do_unlink=True)
-            cutter_object = None
-            if cutter_mesh.users == 0:
-                bpy.data.meshes.remove(cutter_mesh)
-            cutter_mesh = None
-            bpy.data.meshes.remove(backup)
-            backup = None
+            modifier.show_viewport = True
+            modifier.show_in_editmode = True
+            modifier.show_on_cage = False
+            pristine_source = getattr(self, "_boolean_preview_source", None)
+            if pristine_source is None:
+                GeometryMixin._remove_live_boolean_preview(self)
+                raise FairingError(
+                    "Boolean preview lost its pristine source mesh"
+                )
+            restore_mesh_contents(obj, pristine_source)
+            context.view_layer.objects.active = obj
+            obj.select_set(True)
             if obj.mode != 'EDIT':
                 bpy.ops.object.mode_set(mode='EDIT')
-            self._resize_projection_ready = False
-            self._resize_surfaces_by_vertex = {}
-            self._resize_base_bvh = None
-            return
-        except Exception as error:
-            if obj.mode == 'EDIT':
-                bpy.ops.object.mode_set(mode='OBJECT')
-            failed_mesh = obj.data
-            obj.data = backup
-            backup = None
-            if failed_mesh.users == 0:
-                bpy.data.meshes.remove(failed_mesh)
-            if obj.mode != 'EDIT':
-                bpy.ops.object.mode_set(mode='EDIT')
-            self._resize_projection_ready = False
-            if isinstance(error, FairingError):
-                raise
-            raise FairingError(f"Boolean hole reconstruction failed: {error}") from error
-        finally:
-            if modifier_name is not None:
-                modifier = obj.modifiers.get(modifier_name)
-                if modifier is not None:
-                    obj.modifiers.remove(modifier)
-            if cutter_object is not None:
-                bpy.data.objects.remove(cutter_object, do_unlink=True)
-            if cutter_mesh is not None and cutter_mesh.users == 0:
-                bpy.data.meshes.remove(cutter_mesh)
-            if backup is not None and backup.users == 0:
-                bpy.data.meshes.remove(backup)
+            obj.hide_set(True)
+            self._boolean_preview_display_object = display_object
+            self._boolean_preview_cutter_object = cutter_object
+            self._boolean_preview_modifier_name = modifier.name
+
+        display_object.update_tag(refresh={'DATA'})
+        self._boolean_preview_segments = preview_segments
+        self._boolean_preview_last_update = time.monotonic()
+        self._boolean_preview_pending = False
+        build_overlay = getattr(self, "_build_cylinder_preview", None)
+        if build_overlay is not None:
+            build_overlay(context)
+        return True
 
     def _resolve_resize_wall_faces(self, bm):
+        """Reuse verified wall faces only during a coordinate-only modal drag.
+
+        Redo and mesh restoration always perform the full connectivity check.
+        During a drag we own mesh mutations; changing counts, mesh identity,
+        selection, or restoring/rebuilding topology invalidates the cache.
+        """
+        cacheable = bool(getattr(self, "_drag_active", False))
+        counts = (len(bm.verts), len(bm.edges), len(bm.faces))
+        indices = frozenset(self._locked_indices)
+        cached = getattr(self, "_resize_wall_cache", None)
+        if cacheable and cached is not None:
+            cached_bm, cached_counts, cached_indices, faces = cached
+            if (
+                cached_bm is bm and cached_counts == counts and cached_indices == indices
+                and all(face.is_valid for face in faces)
+            ):
+                return faces
+        faces = GeometryMixin._resolve_resize_wall_faces_uncached(self, bm)
+        self._resize_wall_cache = (bm, counts, indices, faces) if cacheable else None
+        return faces
+
+    def _resolve_resize_wall_faces_uncached(self, bm):
         """Return the fitted wall, recovering it when redo indices are stale.
 
         Blender normally restores the pre-operation mesh before executing an
@@ -2188,6 +1558,8 @@ class GeometryMixin:
         )
 
         def wall_measure(face):
+            if face.hide:
+                return None
             points = [matrix_world @ vert.co for vert in face.verts]
             if len(points) < 3:
                 return None
@@ -2251,7 +1623,8 @@ class GeometryMixin:
             if index < 0 or index >= len(bm.faces):
                 indices_valid = False
                 break
-            indexed_faces.append(bm.faces[index])
+            if not bm.faces[index].hide:
+                indexed_faces.append(bm.faces[index])
         expected_counts = (
             int(getattr(self, "fit_mesh_vertex_count", 0)),
             int(getattr(self, "fit_mesh_edge_count", 0)),
@@ -2293,7 +1666,7 @@ class GeometryMixin:
         candidates = {
             face: measure
             for face in bm.faces
-            if (measure := wall_measure(face)) is not None
+            if not face.hide and (measure := wall_measure(face)) is not None
         }
         components = []
         remaining = set(candidates)
@@ -2354,8 +1727,48 @@ class GeometryMixin:
         with its original position before conversion back to object-local space.
         """
         obj = context.active_object
+        fair_only = GeometryMixin._fair_resize_requested(self)
+        if fair_only:
+            if not commit_boolean and getattr(self, "_resize_fair_only_preview", False):
+                return
+            GeometryMixin._replace_boolean_preview_with_source(self, consume=True)
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.verts.ensure_lookup_table()
+            for index, original in (getattr(self, "_original_vertex_coords", None) or {}).items():
+                if index < len(bm.verts):
+                    bm.verts[index].co = original.copy()
+            faces = GeometryMixin._resolve_resize_wall_faces(self, bm)
+            GeometryMixin._build_resize_projection_state(self, bm, faces)
+            if commit_boolean:
+                try:
+                    GeometryMixin._recreate_hole_with_boolean(self, context, bm, faces, fair_only=True)
+                finally:
+                    GeometryMixin._discard_boolean_preview_source(self)
+            else:
+                bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=False)
+                try:
+                    GeometryMixin._update_boolean_preview(self, context, fair_only=True)
+                except FairingError as error:
+                    GeometryMixin._replace_boolean_preview_with_source(self, consume=True)
+                    self.report({'WARNING'}, f"Fair preview failed: {error}")
+            return
+        if getattr(self, "_resize_fair_only_preview", False):
+            GeometryMixin._replace_boolean_preview_with_source(self, consume=True)
+            self._resize_fair_only_preview = False
+        if getattr(self, "_resize_scaled_exit_preview", False):
+            GeometryMixin._replace_boolean_preview_with_source(self, consume=True)
+            self._resize_scaled_exit_preview = False
+        resize_method = getattr(self, "resize_method", 'AUTO')
+        GeometryMixin._resolve_resize_method(self)
+        if resize_method == 'SCALE':
+            # A retained Boolean result must not bypass a new explicit Scaling
+            # choice through the cached-preview or drag-throttle fast paths.
+            GeometryMixin._replace_boolean_preview_with_source(
+                self, consume=True
+            )
         if (
             not commit_boolean
+            and resize_method != 'SCALE'
             and getattr(self, "_boolean_preview_source", None) is not None
             and bool(getattr(self, "_drag_active", False))
             and time.monotonic()
@@ -2364,8 +1777,26 @@ class GeometryMixin:
         ):
             # Keep the previous Boolean mesh visible and let the inexpensive
             # GPU cutter follow every pointer event. The mouse-release handler
-            # performs a trailing rebuild for the final drag value.
+            # performs one trailing cutter update for the final drag value.
             self._boolean_preview_pending = True
+            return
+        if (
+            not commit_boolean
+            and resize_method != 'SCALE'
+            and getattr(self, "_boolean_reconstruction_source", None)
+            is not None
+        ):
+            try:
+                GeometryMixin._apply_cached_boolean_preview(
+                    self,
+                    context,
+                    GeometryMixin._live_boolean_segments(self),
+                )
+            except FairingError as error:
+                GeometryMixin._replace_boolean_preview_with_source(
+                    self, consume=True
+                )
+                self.report({'WARNING'}, f"Boolean preview failed: {error}")
             return
         restored_boolean_preview = False
         if getattr(self, "_boolean_preview_source", None) is not None:
@@ -2380,13 +1811,36 @@ class GeometryMixin:
 
         if not getattr(self, "_resize_projection_ready", False):
             GeometryMixin._build_resize_projection_state(self, bm, faces)
-        if restored_boolean_preview:
+        if restored_boolean_preview and resize_method == 'AUTO':
             self._resize_dynamic_requires_boolean = True
 
         if not getattr(self, "_original_vertex_coords", None):
-            GeometryMixin._capture_deformation_state(
-                self, context, bm, verts
+            deformation_verts = set(verts)
+            deformation_verts.update(
+                bm.verts[index]
+                for index in getattr(
+                    self, "_resize_bore_vertex_indices", set()
+                )
+                if index < len(bm.verts)
             )
+            GeometryMixin._capture_deformation_state(
+                self, context, bm, deformation_verts
+            )
+        else:
+            # Some callers capture the cylinder before fitting its adjacent
+            # support. Include newly recognized cone vertices in that same
+            # immutable deformation baseline.
+            for index in getattr(self, "_resize_conic_surfaces_by_vertex", {}):
+                if (
+                    index < len(bm.verts)
+                    and index not in self._original_vertex_coords
+                ):
+                    if getattr(self, "_proportional_weights", None) is None:
+                        self._proportional_weights = {
+                            key: 1.0 for key in self._original_vertex_coords
+                        }
+                    self._original_vertex_coords[index] = bm.verts[index].co.copy()
+                    self._proportional_weights[index] = 1.0
 
         inverse = obj.matrix_world.inverted_safe()
         fit = self._fit
@@ -2396,31 +1850,18 @@ class GeometryMixin:
         target_slope = GeometryMixin._target_cone_slope(self)
         fitted_slope = float(fit.get("slope", 0.0))
 
-        base_requires_boolean = getattr(
-            self,
-            "_resize_base_requires_boolean",
-            getattr(self, "_resize_requires_boolean", False),
-        )
-        dynamic_requires_boolean = bool(
-            getattr(self, "_resize_dynamic_requires_boolean", False)
-        )
-        if (
-            not base_requires_boolean
-            and not dynamic_requires_boolean
-            and not bool(fit.get("is_stud", False))
-            and GeometryMixin._enlargement_reaches_nonplanar_support(self)
-        ):
-            dynamic_requires_boolean = True
-        self._resize_dynamic_requires_boolean = dynamic_requires_boolean
-        self._resize_requires_boolean = bool(
-            base_requires_boolean or dynamic_requires_boolean
-        )
+        GeometryMixin._resolve_resize_method(self, check_transition=True)
 
         # Confirming untouched dimensions must be an exact geometry no-op. In
         # particular, do not flatten within-epsilon boundary variation onto the
         # best-fit planes. This path also restores the verbatim source geometry
         # when edited dimensions are returned to their fitted values.
-        if math.isclose(
+        cutter_resolution_changed = (
+            getattr(self, "_resize_requires_boolean", False)
+            and int(getattr(self, "boolean_segments", 0) or 0)
+            != int(getattr(self, "fit_angular_segments", 0) or 0)
+        )
+        if resize_method != 'BOOLEAN' and not cutter_resolution_changed and math.isclose(
             target_scale, 1.0, rel_tol=1.0e-6, abs_tol=1.0e-9
         ) and math.isclose(
             depth_scale, 1.0, rel_tol=1.0e-6, abs_tol=1.0e-9
@@ -2430,6 +1871,7 @@ class GeometryMixin:
             for vertex_index, original in self._original_vertex_coords.items():
                 if vertex_index < len(bm.verts):
                     bm.verts[vertex_index].co = original.copy()
+            update_visible_normals(bm)
             bmesh.update_edit_mesh(
                 obj.data, loop_triangles=True, destructive=False
             )
@@ -2447,12 +1889,14 @@ class GeometryMixin:
                     GeometryMixin._discard_boolean_preview_source(self)
             else:
                 # Restore direct-preview vertex movement before snapshotting a
-                # pristine source, then rebuild a cheap 16-sided Boolean result
-                # for the live modal preview. Confirmation restores that source
-                # once more and performs the full-resolution reconstruction.
+                # pristine source, then reconstruct once beneath a reusable
+                # unapplied Boolean modifier for the live modal preview.
+                # Confirmation restores that source once more and performs the
+                # full-resolution reconstruction.
                 for vertex_index, original in self._original_vertex_coords.items():
                     if vertex_index < len(bm.verts):
                         bm.verts[vertex_index].co = original.copy()
+                update_visible_normals(bm)
                 bmesh.update_edit_mesh(
                     obj.data, loop_triangles=True, destructive=False
                 )
@@ -2468,6 +1912,18 @@ class GeometryMixin:
                     )
                     self.report({'WARNING'}, f"Boolean preview failed: {error}")
             return
+
+        connect_exit = GeometryMixin._shortened_through_cone(self)
+        if connect_exit and not commit_boolean:
+            # A topology-changing Scaling preview needs the same pristine
+            # source protection as Boolean preview, for drag/cancel/confirm.
+            for index, original in self._original_vertex_coords.items():
+                if index < len(bm.verts):
+                    bm.verts[index].co = original.copy()
+            update_visible_normals(bm)
+            bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=False)
+            obj.update_from_editmode()
+            self._boolean_preview_source = obj.data.copy()
 
         outer_plane = (
             (self._end_planes or ())[depth_fit["outer_plane_index"]]
@@ -2490,6 +1946,9 @@ class GeometryMixin:
             for vertex_index in plane["verts"]
         }
         selected_indices = {vert.index for vert in verts}
+        bore_indices = set(
+            getattr(self, "_resize_bore_vertex_indices", set())
+        ) - selected_indices
         proportional_weights = getattr(self, "_proportional_weights", None) or {
             index: 1.0 for index in selected_indices
         }
@@ -2497,11 +1956,46 @@ class GeometryMixin:
             if vertex_index >= len(bm.verts):
                 continue
             vert = bm.verts[vertex_index]
+            if not is_visible_vertex(vert):
+                continue
             original = self._original_vertex_coords.get(vertex_index, vert.co)
             world = obj.matrix_world @ original
+            conic_surface = getattr(
+                self, "_resize_conic_surfaces_by_vertex", {}
+            ).get(vertex_index)
+            if conic_surface is not None:
+                world_target = (
+                    world
+                    if vertex_index in conic_surface["conic_outer_vertices"]
+                    else GeometryMixin._conic_continuation_target(
+                        self, world, conic_surface
+                    )
+                )
+                vert.co = inverse @ world.lerp(world_target, weight)
+                continue
             offset = world - fit["center"]
             axial_coordinate = offset.dot(fit["axis"])
             target_axial_coordinate = axial_coordinate
+            if vertex_index in bore_indices and depth_fit:
+                target_inner_coordinate = depth_fit["outer_coordinate"] + (
+                    depth_fit["inner_coordinate"]
+                    - depth_fit["outer_coordinate"]
+                ) * depth_scale
+                source_radius = GeometryMixin._fitted_radius_at(
+                    self, depth_fit["inner_coordinate"]
+                )
+                target_radius = GeometryMixin._target_radius_at(
+                    self, target_inner_coordinate
+                )
+                axial = fit["axis"] * axial_coordinate
+                radial = offset - axial
+                world_target = (
+                    fit["center"]
+                    + axial
+                    + radial * (target_radius / source_radius)
+                )
+                vert.co = inverse @ world.lerp(world_target, weight)
+                continue
             if depth_fit:
                 depth_affects_vertex = vertex_index in selected_indices
                 if not depth_affects_vertex and abs(inner_half_space) > 1.0e-12:
@@ -2533,31 +2027,65 @@ class GeometryMixin:
             # an interior rim must remain on its own fitted cap surface instead
             # of accidentally hitting the exterior plane. Shrinking either rim
             # intersects its own virtual fairing hypothesis along the hole axis.
-            # Depth translation is applied afterward so combined edits remain
-            # coherent.
+            # Only blind caps follow the depth translation. The exterior
+            # support stays fixed, even when its rim is not exactly normal to
+            # the fitted axis (or has within-tolerance coordinate noise).
             projection_used = False
             surface = getattr(
                 self, "_resize_surfaces_by_vertex", {}
             ).get(vertex_index)
+            connecting_exit = (
+                connect_exit and vertex_index in self._conic_exit_vertex_indices
+            )
+            fixed_exterior = (
+                surface is not None and surface["exterior"] and not connecting_exit
+            )
             radius_changed = not math.isclose(
                 target_radius,
                 source_radius,
                 rel_tol=1.0e-6,
                 abs_tol=1.0e-9,
             )
-            if surface is not None and radius_changed:
+            if (
+                surface is not None
+                and (
+                    radius_changed
+                    or not math.isclose(depth_scale, 1.0, rel_tol=1.0e-6)
+                )
+                and not surface.get("bore_continuation", False)
+                and not connecting_exit
+            ):
                 depth_delta = fit["axis"] * (
                     target_axial_coordinate - axial_coordinate
                 )
                 projection_point = world_target - depth_delta
                 if target_radius > source_radius and surface["exterior"]:
-                    projected = GeometryMixin._project_bvh_along_axis(
-                        getattr(self, "_resize_base_bvh", None),
-                        getattr(self, "_resize_base_span", 0.0),
-                        projection_point,
-                        world,
-                        fit["axis"],
-                    )
+                    hypothesis = surface["hypothesis"]
+                    if (
+                        hypothesis.get("method") == "PLANES"
+                        and len(hypothesis.get("planes", ())) == 1
+                    ):
+                        # The dynamic mode check has already established that
+                        # this enlarged rim remains on its accepted planar
+                        # collar. Intersect that plane directly: a bidirectional
+                        # whole-mesh ray can miss a triangulation boundary and
+                        # incorrectly choose the opposite side of the model.
+                        projected = (
+                            GeometryMixin._project_hypothesis_along_axis(
+                                hypothesis,
+                                projection_point,
+                                world,
+                                fit["axis"],
+                            )
+                        )
+                    else:
+                        projected = GeometryMixin._project_bvh_along_axis(
+                            getattr(self, "_resize_base_bvh", None),
+                            getattr(self, "_resize_base_span", 0.0),
+                            projection_point,
+                            world,
+                            fit["axis"],
+                        )
                 elif surface["hypothesis"].get("method") == "ORGANIC":
                     projected = GeometryMixin._project_bvh_along_axis(
                         surface.get("organic_bvh"),
@@ -2574,7 +2102,11 @@ class GeometryMixin:
                         fit["axis"],
                     )
                 if projected is not None:
-                    world_target = projected + depth_delta
+                    world_target = (
+                        projected
+                        if fixed_exterior
+                        else projected + depth_delta
+                    )
                     projection_used = True
 
             # Follow the target cone generator to the translated end plane. For
@@ -2597,7 +2129,7 @@ class GeometryMixin:
                 denominator = plane["normal"].dot(generator)
                 if abs(denominator) > 1.0e-8:
                     plane_point = plane["point"]
-                    if depth_fit:
+                    if depth_fit and plane is not outer_plane and not fixed_exterior:
                         plane_coordinate = plane["normal"].dot(
                             plane_point - fit["center"]
                         ) / denominator
@@ -2614,14 +2146,31 @@ class GeometryMixin:
             blended_world = world.lerp(world_target, weight)
             vert.co = inverse @ blended_world
 
-        if commit_boolean and target_scale < 1.0 - 1.0e-9:
+        # The next wall flood/fitting pass reads BMesh face normals. Keep them
+        # consistent with the new coordinates, especially when a cone becomes
+        # a cylinder and its wall must join the continuing bore selection.
+        update_visible_normals(bm)
+        if connect_exit:
+            self._resize_wall_cache = None
+            GeometryMixin._connect_scaled_conic_exit(self, bm, faces)
+            self._resize_scaled_exit_preview = not commit_boolean
+            bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+            if commit_boolean:
+                GeometryMixin._discard_boolean_preview_source(self)
+            return
+
+        if (
+            commit_boolean
+            and target_scale < 1.0 - 1.0e-9
+            and getattr(self, "scaling_final_simplify", False)
+        ):
             result = expanded_limited_dissolve(bm, faces)
             for face in bm.faces:
                 face.select = False
             for face in result["faces"]:
                 if face.is_valid:
                     face.select = True
-            bm.normal_update()
+            update_visible_normals(bm)
             bmesh.update_edit_mesh(
                 obj.data, loop_triangles=True, destructive=True
             )

@@ -13,22 +13,38 @@ import numpy as np
 
 from bpy_extras import view3d_utils
 from mathutils import Vector
-from mathutils.bvhtree import BVHTree
 
 from .constants import (
     ADDON_VERSION,
     DIAMETER_ESTIMATOR_ITEMS,
     FLOOD_ANGLE_HUD_SECONDS,
+    RESIZE_METHOD_ITEMS,
     VIEW_NAVIGATION_EVENTS,
 )
 from .fairing import FairingError
-from .geometry import GeometryMixin
+from .geometry import GeometryMixin, _BOOLEAN_PREVIEW_INTERVAL
+from .mesh_state import restore_mesh_contents
+from .resize_state import reset_mesh_derived_state
+from .modal_session import begin_modal_session, end_modal_session, cancel_modal_sessions
+from .visible_geometry import visible_bvh, update_visible_normals
 from .gpu_preview import GpuPreviewMixin, _ui_scale
+from .preview_cache import clear_draw_cache
+from .resize_dimensions import (
+    _cylinder_inradius_factor,
+    # Retain this import path for existing headless clients and regression tests.
+    _conic_depth_preserving_bottom as _conic_depth_preserving_bottom,
+    _update_conic_angle,
+    _update_conic_depth,
+    _update_conic_truncated_depth,
+    _update_diameter_estimator,
+)
 
 
 _modal_active = False
 _draw_handles = set()
 _persistent_preview = None
+_DRAG_PREVIEW_INTERVAL = 1.0 / 30.0
+_drag_timers = []
 
 
 def _is_view_navigation_event(event_type):
@@ -36,33 +52,25 @@ def _is_view_navigation_event(event_type):
     return event_type in VIEW_NAVIGATION_EVENTS or event_type.startswith('NDOF_')
 
 
-def _update_diameter_estimator(operator, _context):
-    """Switch the fitted baseline and diameter when Redo changes estimator."""
-    if not operator.fit_valid:
-        return
-    radius = {
-        'MINIMUM': operator.fit_radius_minimum,
-        'AVERAGE': operator.fit_radius_average,
-        'MAXIMUM': operator.fit_radius_maximum,
-    }.get(operator.diameter_estimator, operator.fit_radius_average)
-    if radius <= 1.0e-12:
-        return
-    operator.fit_radius = radius
-    coordinate = getattr(operator, "fit_radius_coordinate", 0.0)
-    slope = getattr(operator, "fit_slope", 0.0)
-    operator.diameter = max(1.0e-9, radius + slope * coordinate) * 2.0
-    fit = getattr(operator, "_fit", None)
-    if fit is not None:
-        fit["radius"] = radius
+def _update_resize_method(operator, context):
+    """Reflect an explicit redo choice without re-running automatic selection."""
+    # Blender also invokes RNA updates on the argument-only OperatorProperties
+    # wrapper, which cannot own our transient Python preview attributes.
+    if not isinstance(operator, bpy.types.OperatorProperties):
+        GeometryMixin._resolve_resize_method(operator)
+        operator._boolean_preview_pending = False
+    if context.area is not None:
+        context.area.tag_redraw()
 
 
 class _PersistentPreview:
     """Own a post-modal GPU preview without retaining an Operator RNA object.
 
     Blender may invalidate the Python wrapper for a completed operator while its
-    Redo panel is still active. This plain Python object copies only the drawing
-    data needed to keep the cylinder visible and follows the last-operation stack
-    so it can remove itself when Resize Hole is no longer the redoable action.
+    Redo panel is still active. This plain Python owner retains the drawing data
+    needed to keep the cylinder visible plus a canonical source-mesh snapshot,
+    and follows the last-operation stack so it can release both when Resize Hole
+    is no longer the redoable action.
     """
 
     def __init__(self, operator, context):
@@ -76,16 +84,50 @@ class _PersistentPreview:
         self._numeric_input = operator._numeric_input
         self._diameter_text = operator._diameter_text
         self._depth_text = operator._depth_text
+        self._truncated_depth_text = operator._truncated_depth_text
         self._conic_angle_text = operator._conic_angle_text
         self._active_dimension = operator._active_dimension
         self.depth_valid = operator.depth_valid
         self.angle_valid = operator.angle_valid
         self._draw_error_reported = False
+        self._source_object_name = operator._object.name
+        (
+            self._source_mesh_name,
+            self._source_mesh,
+            self._source_bmesh,
+            self._source_materials,
+        ) = self._capture_canonical_source(operator)
         self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
             self._draw_preview, (), 'WINDOW', 'POST_PIXEL'
         )
         _draw_handles.add(self._draw_handle)
         self._watch_last_operation(context)
+
+    @staticmethod
+    def _capture_canonical_source(operator):
+        """Copy the pre-preview mesh used as the baseline for every redo."""
+        operator._object.update_from_editmode()
+        source_mesh = operator._object.data
+        canonical_mesh = source_mesh.copy()
+        # A direct (non-Boolean) modal preview deforms the real edit mesh so the
+        # user can see every drag immediately.  The redo baseline must predate
+        # that preview; otherwise each Adjust Last Operation execution starts
+        # from an already resized hole and compounds both radius and depth.
+        # Boolean previews keep the real object pristine, so applying the same
+        # captured coordinates is harmless there.
+        original_coords = getattr(operator, "_original_vertex_coords", None) or {}
+        for vertex_index, coordinate in original_coords.items():
+            if vertex_index < len(canonical_mesh.vertices):
+                canonical_mesh.vertices[vertex_index].co = coordinate
+        canonical_mesh.update()
+        canonical_bmesh = bmesh.new()
+        canonical_bmesh.from_mesh(canonical_mesh)
+        return (
+            source_mesh.name,
+            canonical_mesh,
+            canonical_bmesh,
+            list(source_mesh.materials),
+        )
 
     def update_from(self, operator, context):
         """Refresh copied geometry and label text after a Redo-panel execution."""
@@ -95,6 +137,7 @@ class _PersistentPreview:
         self._numeric_input = operator._numeric_input
         self._diameter_text = operator._diameter_text
         self._depth_text = operator._depth_text
+        self._truncated_depth_text = operator._truncated_depth_text
         self._conic_angle_text = operator._conic_angle_text
         self._active_dimension = operator._active_dimension
         self.depth_valid = operator.depth_valid
@@ -103,15 +146,49 @@ class _PersistentPreview:
             context.area.tag_redraw()
 
     def remove(self):
-        """Remove this preview's draw handler if it is still registered."""
-        if self._draw_handle is None:
-            return
-        try:
-            bpy.types.SpaceView3D.draw_handler_remove(self._draw_handle, 'WINDOW')
-        except ValueError:
-            pass
-        _draw_handles.discard(self._draw_handle)
-        self._draw_handle = None
+        """Remove drawing state and release the canonical redo source."""
+        clear_draw_cache(self)
+        if self._draw_handle is not None:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(self._draw_handle, 'WINDOW')
+            except ValueError:
+                pass
+            _draw_handles.discard(self._draw_handle)
+            self._draw_handle = None
+        source_mesh = getattr(self, "_source_mesh", None)
+        self._source_mesh = None
+        if source_mesh is not None:
+            try:
+                if source_mesh.users == 0:
+                    bpy.data.meshes.remove(source_mesh)
+            except ReferenceError:
+                pass
+        source_bmesh = getattr(self, "_source_bmesh", None)
+        self._source_bmesh = None
+        if source_bmesh is not None and source_bmesh.is_valid:
+            source_bmesh.free()
+
+    def restore_source(self, obj):
+        """Restore the modal input before every confirmation or redo execute."""
+        if obj is None or obj.name != self._source_object_name:
+            return False
+        source_bmesh = getattr(self, "_source_bmesh", None)
+        if source_bmesh is None or not source_bmesh.is_valid:
+            return False
+
+        # Exact-Boolean modal previews hide the real edit object while a
+        # separate display object shows the unapplied modifier result. A hidden
+        # object cannot pass object.mode_set's poll even when it is assigned as
+        # the view-layer active object, so make the source visible and active
+        # before either mode transition.
+        obj.hide_set(False)
+        bpy.context.view_layer.objects.active = obj
+        obj.select_set(True)
+        restore_mesh_contents(obj, source_bmesh, self._source_materials)
+        bpy.context.view_layer.objects.active = obj
+        obj.select_set(True)
+        bpy.ops.object.mode_set(mode='EDIT')
+        return True
 
     def _watch_last_operation(self, context):
         """Poll Blender's last operation and retire the preview when it changes.
@@ -191,7 +268,7 @@ class MESH_OT_holey_tools_resize_hole(
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
     bl_description = (
         "Hover to flood-fill a circular wall, click to fit its cone or cylinder, "
-        "then click again to apply"
+        "then click again to apply. Ctrl/Cmd-click to use selected wall faces instead"
     )
 
     scale: bpy.props.FloatProperty(
@@ -204,7 +281,7 @@ class MESH_OT_holey_tools_resize_hole(
     )
     diameter: bpy.props.FloatProperty(
         name="Diameter",
-        description="Physical world-space diameter of the resized hole",
+        description="World-space diameter; for a cylindrical hole, the circle fitting inside its polygonal wall",
         default=0.0,
         min=0.0,
         subtype='DISTANCE',
@@ -212,25 +289,53 @@ class MESH_OT_holey_tools_resize_hole(
     )
     depth: bpy.props.FloatProperty(
         name="Depth",
-        description="World-space distance between two planar hole-end centers",
+        description=(
+            "For cones, distance from the exterior rim plane to the theoretical "
+            "tip; otherwise the distance between the hole ends"
+        ),
         default=0.0,
         min=0.0,
         subtype='DISTANCE',
         unit='LENGTH',
+        update=_update_conic_depth,
+    )
+    truncated_depth: bpy.props.FloatProperty(
+        name="Truncated Depth",
+        description=(
+            "Axial distance from the exterior rim plane to the actual truncated "
+            "end of the selected conic region"
+        ),
+        default=0.0,
+        min=0.0,
+        subtype='DISTANCE',
+        unit='LENGTH',
+        update=_update_conic_truncated_depth,
     )
     conic_angle: bpy.props.FloatProperty(
         name="Conic Angle",
-        description="Half-angle between the fitted conic wall and its axis",
+        description=(
+            "Full included angle at the theoretical cone tip; edits pivot "
+            "around the bottom truncation circle. Zero removes the taper "
+            "while preserving the connected bore"
+        ),
         default=0.0,
         min=0.0,
-        max=math.radians(89.0),
+        max=math.radians(178.0),
         subtype='ANGLE',
+        update=_update_conic_angle,
+    )
+    resize_method: bpy.props.EnumProperty(
+        name="Resize Method",
+        description="Choose direct scaling, Exact Boolean reconstruction, or automatic selection",
+        items=RESIZE_METHOD_ITEMS,
+        default='AUTO',
+        update=_update_resize_method,
     )
     flood_angle: bpy.props.FloatProperty(
         name="Flood Angle",
         description="Maximum angle between neighboring faces in the hover flood fill",
         subtype='ANGLE',
-        default=math.radians(60.0),
+        default=math.radians(25.0),
         min=math.radians(0.1),
         max=math.radians(89.9),
     )
@@ -243,10 +348,10 @@ class MESH_OT_holey_tools_resize_hole(
         options={'SKIP_SAVE'},
     )
     fairing_method: bpy.props.EnumProperty(
-        name="Reconstruction Surface",
-        description="Surface model used to reconstruct the mesh before Boolean cutting",
+        name="Reconstruction Fit",
+        description="Surface fit used to reconstruct the mesh before Boolean cutting",
         items=(
-            ('AUTO', "Auto", "Use the accepted automatic fit"),
+            ('AUTO', "Auto Fit", "Use the accepted automatic fit"),
             ('PLANES', "N-Plane", "Fit one to three adjacent planes"),
             ('CYLINDER', "Cylinder", "Force a zero-slope circular-cylinder fit"),
             ('SPHERE', "Sphere", "Force a spherical fit"),
@@ -255,11 +360,11 @@ class MESH_OT_holey_tools_resize_hole(
         default='AUTO',
     )
     fill_style: bpy.props.EnumProperty(
-        name="Reconstruction Fill",
+        name="Reconstruction Topology",
         description="Topology used to reconstruct the old opening",
         items=(
-            ('AUTO', "Auto", "Use the topology associated with the surface fit"),
-            ('GRID', "Grid", "Clip a source-aligned grid to the opening"),
+            ('AUTO', "Auto Topology", "Choose topology from the selected fit"),
+            ('GRID', "Grid", "Fit a source-aligned quad patch to the opening"),
             ('CIRCLE', "Circle", "Use concentric rings and a center fan"),
         ),
         default='AUTO',
@@ -267,22 +372,27 @@ class MESH_OT_holey_tools_resize_hole(
     circle_loops: bpy.props.IntProperty(
         name="Circle Loops",
         description="Concentric reconstruction loops before the center fan",
-        default=2,
+        default=5,
         min=0,
         max=64,
     )
-    grid_angle: bpy.props.FloatProperty(
-        name="Grid Angle Offset",
-        description="Rotate the reconstruction grid from its inferred alignment",
-        default=0.0,
-        subtype='ANGLE',
-        soft_min=-math.pi * 0.5,
-        soft_max=math.pi * 0.5,
+    grid_match_curvature: bpy.props.BoolProperty(
+        name="Match Curvature (C2)",
+        description="Estimate a curvature-matching ideal surface for the Manhattan grid patch",
+        default=True,
     )
     final_simplify: bpy.props.BoolProperty(
         name="Final Simplify",
         description="Simplify the resized Boolean result after reconstruction",
         default=True,
+    )
+    scaling_final_simplify: bpy.props.BoolProperty(
+        name="Final Simplify",
+        description=(
+            "Expand the directly scaled wall selection and run Limited Dissolve "
+            "after committing a smaller hole"
+        ),
+        default=False,
     )
     boolean_segments: bpy.props.IntProperty(
         name="Boolean Segments",
@@ -298,7 +408,14 @@ class MESH_OT_holey_tools_resize_hole(
     reconstruction_result_fill_style: bpy.props.StringProperty(
         default="", options={'HIDDEN', 'SKIP_SAVE'}
     )
+    reconstruction_grid_edge_length: bpy.props.FloatProperty(
+        name="Estimated Edge Size", default=0.0,
+        subtype='DISTANCE', unit='LENGTH', options={'HIDDEN', 'SKIP_SAVE'},
+    )
     fit_valid: bpy.props.BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
+    conic_dimensions_updating: bpy.props.BoolProperty(
+        default=False, options={'HIDDEN', 'SKIP_SAVE'}
+    )
     fit_face_indices: bpy.props.StringProperty(
         default="", options={'HIDDEN', 'SKIP_SAVE'}
     )
@@ -348,10 +465,26 @@ class MESH_OT_holey_tools_resize_hole(
     fit_depth_outer: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_depth_inner: bpy.props.FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_depth_outer_plane: bpy.props.IntProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    fit_conic_depth_initial: bpy.props.FloatProperty(
+        options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    fit_truncated_depth_initial: bpy.props.FloatProperty(
+        options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    fit_conic_bottom_radius: bpy.props.FloatProperty(
+        default=0.0, options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    conic_angle_previous: bpy.props.FloatProperty(
+        default=0.0, options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    conic_depth_previous: bpy.props.FloatProperty(
+        default=0.0, options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    conic_truncated_depth_previous: bpy.props.FloatProperty(
+        default=0.0, options={'HIDDEN', 'SKIP_SAVE'}
+    )
 
     _draw_handle = None
-    _fill_batch = None
-    _line_batch = None
     _fill_coords = None
     _line_coords = None
     _draw_error_reported = False
@@ -373,10 +506,16 @@ class MESH_OT_holey_tools_resize_hole(
     _resize_requires_boolean = False
     _resize_dynamic_requires_boolean = False
     _resize_surfaces_by_vertex = None
+    _resize_bore_vertex_indices = None
     _resize_base_bvh = None
     _resize_base_span = 0.0
     _resize_angular_segments = 0
     _boolean_preview_source = None
+    _boolean_reconstruction_source = None
+    _boolean_reconstruction_blind_coordinates = None
+    _boolean_preview_display_object = None
+    _boolean_preview_cutter_object = None
+    _boolean_preview_modifier_name = ""
     _boolean_preview_segments = 0
     _boolean_preview_last_update = 0.0
     _boolean_preview_pending = False
@@ -386,6 +525,7 @@ class MESH_OT_holey_tools_resize_hole(
     _numeric_replace = True
     _diameter_text = ""
     _depth_text = ""
+    _truncated_depth_text = ""
     _conic_angle_text = ""
     _active_dimension = 'DIAMETER'
     _drag_active = False
@@ -414,18 +554,37 @@ class MESH_OT_holey_tools_resize_hole(
 
     def draw(self, context):
         """Draw dimensions available in the Redo panel for the fitted wall."""
-        self.layout.prop(self, "diameter_estimator")
-        row = self.layout.row()
-        row.activate_init = True
-        row.prop(self, "diameter")
-        if self.depth_valid:
-            self.layout.prop(self, "depth")
-        if self.angle_valid:
+        conic_dimensions = bool(self.angle_valid and self.depth_valid)
+        if not conic_dimensions:
+            self.layout.prop(self, "diameter_estimator")
+        if conic_dimensions:
+            row = self.layout.row()
+            row.activate_init = True
+            row.prop(self, "depth")
+            self.layout.prop(self, "truncated_depth")
             self.layout.prop(self, "conic_angle")
-        if getattr(self, "_resize_requires_boolean", False):
+        else:
+            row = self.layout.row()
+            row.activate_init = True
+            row.prop(self, "diameter")
+            if self.depth_valid:
+                self.layout.prop(self, "depth")
+            if self.angle_valid:
+                self.layout.prop(self, "conic_angle")
+        self.layout.prop(self, "resize_method", expand=True)
+        boolean_active = (
+            self.resize_method == 'BOOLEAN'
+            or (
+                self.resize_method == 'AUTO'
+                and getattr(self, "_resize_requires_boolean", False)
+            )
+        )
+        fair_only = GeometryMixin._fair_resize_requested(self)
+        if boolean_active or fair_only:
             box = self.layout.box()
-            box.label(text="Reconstruction: Exact Boolean", icon='MOD_BOOLEAN')
-            box.prop(self, "boolean_segments")
+            box.label(text="Reconstruction: Fair Hole" if fair_only else "Reconstruction: Exact Boolean", icon='MOD_BOOLEAN')
+            if not fair_only:
+                box.prop(self, "boolean_segments")
             box.prop(self, "fairing_method")
             box.prop(self, "fill_style")
             effective_fill = (
@@ -435,20 +594,24 @@ class MESH_OT_holey_tools_resize_hole(
             )
             if effective_fill == 'CIRCLE':
                 box.prop(self, "circle_loops")
-            elif effective_fill == 'GRID':
-                box.prop(self, "grid_angle")
+            elif effective_fill == 'GRID' and self.reconstruction_result_method not in {'PLANES', 'CONIC', 'SPHERE'}:
+                box.prop(self, "grid_match_curvature")
             box.prop(self, "final_simplify")
             if self.reconstruction_result_method:
                 box.label(
-                    text=f"Surface result: {self.reconstruction_result_method.title()}"
+                    text=f"Fit result: {self.reconstruction_result_method.title()}"
                 )
             if self.reconstruction_result_fill_style:
                 box.label(
                     text=(
-                        "Fill result: "
+                        "Topology result: "
                         f"{self.reconstruction_result_fill_style.title()}"
                     )
                 )
+        else:
+            box = self.layout.box()
+            box.label(text="Resize: Scaling", icon='FULLSCREEN_ENTER')
+            box.prop(self, "scaling_final_simplify")
 
     @staticmethod
     def _tag_redraw(context):
@@ -458,8 +621,7 @@ class MESH_OT_holey_tools_resize_hole(
 
     def _clear_batches(self, context):
         """Discard all preview geometry and request a viewport redraw."""
-        self._fill_batch = None
-        self._line_batch = None
+        clear_draw_cache(self)
         self._fill_coords = None
         self._line_coords = None
         self._tag_redraw(context)
@@ -467,9 +629,14 @@ class MESH_OT_holey_tools_resize_hole(
     def _finish_modal(self, context):
         """Release transient modal resources and restore viewport UI state."""
         global _modal_active
+        end_modal_session(self)
+        MESH_OT_holey_tools_resize_hole._remove_drag_timer(self, context)
+        self._resize_wall_cache = None
+        self._hover_cache = self._hover_region = self._hover_preview_region = None
         self._remove_draw_handler()
         self._clear_batches(context)
         self._bvh = None
+        self._bvh_faces = ()
         self._object = None
         self._region = None
         self._region_data = None
@@ -496,10 +663,16 @@ class MESH_OT_holey_tools_resize_hole(
         completes the Blender operator, making its properties available to Redo.
         """
         global _modal_active, _persistent_preview
+        end_modal_session(self)
+        MESH_OT_holey_tools_resize_hole._remove_drag_timer(self, context)
+        self._resize_wall_cache = None
+        self._hover_cache = self._hover_region = self._hover_preview_region = None
         self._bvh = None
+        self._bvh_faces = ()
         self._mouse_entered_view = False
         _modal_active = False
         self._remove_draw_handler()
+        clear_draw_cache(self)
         if _persistent_preview is not None:
             _persistent_preview.remove()
         _persistent_preview = _PersistentPreview(self, context)
@@ -530,7 +703,52 @@ class MESH_OT_holey_tools_resize_hole(
         for index, coordinate in self._original_vertex_coords.items():
             if index < len(bm.verts):
                 bm.verts[index].co = coordinate
+        update_visible_normals(bm)
         bmesh.update_edit_mesh(self._object.data, loop_triangles=True, destructive=False)
+
+    def _modal_dimensions_changed(self):
+        """Return whether the modal session differs from its fitted baseline.
+
+        The baseline is captured only after fitting has initialized every
+        user-facing dimension. Comparing the values, rather than mouse motion,
+        also treats a drag or numeric edit that returns to its starting value as
+        unchanged.
+        """
+        initial = getattr(self, "_modal_initial_dimensions", None)
+        if initial is None:
+            # A missing baseline indicates a non-modal or partially restored
+            # execution. Never suppress real work in that defensive case.
+            return True
+        names = {'diameter'}
+        if getattr(self, "depth_valid", False):
+            names.add('depth')
+        if getattr(self, "angle_valid", False):
+            names.add('conic_angle')
+            if getattr(self, "depth_valid", False):
+                names.add('truncated_depth')
+                names.discard('diameter')
+        for name in names:
+            baseline = initial[name]
+            current = float(getattr(self, name))
+            tolerance = max(abs(baseline), abs(current), 1.0) * 1.0e-9
+            if not math.isclose(
+                current,
+                baseline,
+                rel_tol=1.0e-9,
+                abs_tol=tolerance,
+            ):
+                return True
+        return False
+
+    def _cancel_unchanged_modal(self, context):
+        """Cancel a fitted interaction that has not changed any dimension."""
+        if MESH_OT_holey_tools_resize_hole._modal_dimensions_changed(self):
+            return False
+        self._restore_original_geometry()
+        self._restore_initial_selection()
+        self._runtime_cancelled = True
+        self._finish_modal(context)
+        return True
 
     def _set_status_text(self, context):
         """Describe controls and current values for the active modal stage."""
@@ -557,13 +775,26 @@ class MESH_OT_holey_tools_resize_hole(
 
             context.workspace.status_text_set(draw_status)
         else:
-            active = self._active_dimension.title()
-            dimensions = f"Diameter: {self._diameter_text}"
-            if self.depth_valid:
+            active = self._active_dimension.replace('_', ' ').title()
+            if self.angle_valid and self.depth_valid:
+                dimensions = (
+                    f"Depth: {self._depth_text}  •  "
+                    f"Truncated Depth: {self._truncated_depth_text}  •  "
+                    f"Included Angle: {self._conic_angle_text}"
+                )
+            else:
+                dimensions = f"Diameter: {self._diameter_text}"
+            if self.depth_valid and not self.angle_valid:
                 dimensions += f"  •  Depth: {self._depth_text}"
-            if self.angle_valid:
+            if self.angle_valid and not self.depth_valid:
                 dimensions += f"  •  Conic Angle: {self._conic_angle_text}"
-            if getattr(self, "_resize_requires_boolean", False):
+            if (
+                self.resize_method == 'BOOLEAN'
+                or (
+                    self.resize_method == 'AUTO'
+                    and getattr(self, "_resize_requires_boolean", False)
+                )
+            ):
                 dimensions += "  •  Rebuild: Exact Boolean"
             step_hint = (
                 "+/-: 1° (Shift: 0.1°)"
@@ -587,17 +818,30 @@ class MESH_OT_holey_tools_resize_hole(
         bm.faces.ensure_lookup_table()
         if self._hover_face_index >= len(bm.faces):
             return
-        faces = self._flood_fill(bm.faces[self._hover_face_index])
-        self._candidate_indices = {face.index for face in faces}
-        self._build_selection_preview(context, faces)
-        self._set_status_text(context)
+        self._set_hover_seed(context, bm.faces[self._hover_face_index])
 
     def _set_hover_seed(self, context, face):
         """Flood from ``face`` and publish the resulting selection preview."""
+        self._hover_region = None
         faces = self._flood_fill(face)
         self._hover_face_index = face.index
+        region = getattr(self, "_hover_region", None)
+        if (
+            region is not None and region is getattr(self, "_hover_preview_region", None)
+            and getattr(self, "_fill_coords", None) is not None
+        ):
+            return
         self._candidate_indices = {candidate.index for candidate in faces}
-        self._build_selection_preview(context, faces)
+        if region is not None and region.triangles is not None:
+            self._fill_coords = region.triangles
+            self._line_coords = None
+            self._draw_error_reported = False
+            self._tag_redraw(context)
+        else:
+            self._build_selection_preview(context, faces)
+            if region is not None:
+                region.triangles = self._fill_coords
+        self._hover_preview_region = region
         self._set_status_text(context)
 
     def _change_flood_angle(self, context, direction, fine_adjustment=False):
@@ -707,8 +951,11 @@ class MESH_OT_holey_tools_resize_hole(
 
         bm = bmesh.from_edit_mesh(self._object.data)
         bm.faces.ensure_lookup_table()
+        GeometryMixin._get_hover_cache(self)
         if self._bvh is None:
-            self._bvh = BVHTree.FromBMesh(bm)
+            self._bvh, self._bvh_faces = visible_bvh(bm)
+        if self._bvh is None:
+            return
 
         # Modal operators launched from the N-panel retain that UI region in
         # context. Convert window coordinates explicitly into the View3D WINDOW
@@ -742,14 +989,14 @@ class MESH_OT_holey_tools_resize_hole(
             origin_local, direction_local
         )
 
-        if face_index is None or face_index < 0 or face_index >= len(bm.faces):
+        if face_index is None or face_index < 0 or face_index >= len(self._bvh_faces):
             self._hover_face_index = -1
             self._candidate_indices = set()
             self._clear_batches(context)
             self._set_status_text(context)
             return
 
-        face = bm.faces[face_index]
+        face = self._bvh_faces[face_index]
         if face.hide:
             self._hover_face_index = -1
             self._candidate_indices = set()
@@ -771,7 +1018,16 @@ class MESH_OT_holey_tools_resize_hole(
         as compact JSON.
         """
         fit = self._fit
-        if getattr(self, "_resize_requires_boolean", False):
+        # Dimension callbacks are meaningful only after every fitted baseline
+        # has been serialized. A reused operator may still carry a true flag.
+        self.fit_valid = False
+        if fit.get("is_cone", False):
+            # A conic frustum's two end circles define physical truncation even
+            # when the smaller one continues into a normal cylindrical bore.
+            self._depth_fit = GeometryMixin._fit_adjustable_depth(
+                self, self._end_planes or (), fit
+            )
+        elif getattr(self, "_resize_requires_boolean", False):
             self._depth_fit = GeometryMixin._fit_reconstruction_depth(self)
         else:
             self._depth_fit = GeometryMixin._fit_adjustable_depth(
@@ -782,12 +1038,27 @@ class MESH_OT_holey_tools_resize_hole(
             self._depth_fit["outer_coordinate"] if self._depth_fit else 0.0
         )
         self.scale = 1.0
+        self.fit_angular_segments = max(
+            3, int(getattr(self, "_resize_angular_segments", 0) or 32)
+        )
+        inradius_factor = _cylinder_inradius_factor(self)
+        inradius_estimates = fit.get("inradius_estimates")
+        if inradius_factor < 1.0 and inradius_estimates:
+            # Preserve the internal vertex-radius convention for deformation;
+            # use actual wall-plane clearance for the public hole diameter.
+            fit["radius_estimates"] = {
+                key: value / inradius_factor
+                for key, value in inradius_estimates.items()
+            }
+            fit["radius"] = fit["radius_estimates"].get(
+                getattr(self, "diameter_estimator", 'AVERAGE'),
+                fit["radius_estimates"]['AVERAGE'],
+            )
         self.diameter = GeometryMixin._fitted_radius_at(
             self, fit["radius_coordinate"]
-        ) * 2.0
+        ) * 2.0 * _cylinder_inradius_factor(self)
         self.angle_valid = bool(fit.get("is_cone", False))
-        self.conic_angle = float(fit.get("half_angle", 0.0))
-        self.fit_valid = True
+        self.conic_angle = float(fit.get("half_angle", 0.0)) * 2.0
         self.fit_face_indices = ",".join(str(index) for index in sorted(self._locked_indices))
         self.fit_axis = fit["axis"]
         self.fit_basis_x = fit["basis_x"]
@@ -804,9 +1075,6 @@ class MESH_OT_holey_tools_resize_hole(
         self.fit_z_min = fit["z_min"]
         self.fit_z_max = fit["z_max"]
         self.fit_is_stud = fit.get("is_stud", False)
-        self.fit_angular_segments = max(
-            3, int(getattr(self, "_resize_angular_segments", 0) or 32)
-        )
         source_mesh = self._object.data
         self.fit_mesh_vertex_count = len(source_mesh.vertices)
         self.fit_mesh_edge_count = len(source_mesh.edges)
@@ -834,17 +1102,46 @@ class MESH_OT_holey_tools_resize_hole(
             separators=(",", ":"),
         )
         if self.depth_valid:
-            self.depth = self._depth_fit["initial"]
             self.fit_depth_initial = self._depth_fit["initial"]
             self.fit_depth_outer = self._depth_fit["outer_coordinate"]
             self.fit_depth_inner = self._depth_fit["inner_coordinate"]
             self.fit_depth_outer_plane = self._depth_fit["outer_plane_index"]
+            if self.angle_valid and abs(float(fit.get("slope", 0.0))) > 1.0e-12:
+                self.truncated_depth = self._depth_fit["initial"]
+                self.fit_truncated_depth_initial = self.truncated_depth
+                self.fit_conic_bottom_radius = float(
+                    getattr(self, "_conic_bore_radius", 0.0)
+                    or GeometryMixin._fitted_radius_at(
+                        self, self._depth_fit["inner_coordinate"]
+                    )
+                )
+                self.depth = (
+                    GeometryMixin._fitted_radius_at(
+                        self, self._depth_fit["outer_coordinate"]
+                    )
+                    / abs(float(fit["slope"]))
+                )
+                self.fit_conic_depth_initial = self.depth
+            else:
+                self.depth = self._depth_fit["initial"]
+                self.truncated_depth = 0.0
+                self.fit_truncated_depth_initial = 0.0
+                self.fit_conic_depth_initial = 0.0
+                self.fit_conic_bottom_radius = 0.0
         else:
             self.depth = 0.0
+            self.truncated_depth = 0.0
             self.fit_depth_initial = 0.0
             self.fit_depth_outer = 0.0
             self.fit_depth_inner = 0.0
             self.fit_depth_outer_plane = 0
+            self.fit_truncated_depth_initial = 0.0
+            self.fit_conic_depth_initial = 0.0
+            self.fit_conic_bottom_radius = 0.0
+        self.conic_depth_previous = self.depth
+        self.conic_truncated_depth_previous = self.truncated_depth
+        self.conic_angle_previous = self.conic_angle
+        self.fit_valid = True
 
     def _restore_fit_for_redo(self):
         """Reconstruct transient fit state from hidden RNA redo properties.
@@ -963,8 +1260,12 @@ class MESH_OT_holey_tools_resize_hole(
         """Format the current depth for numeric input and overlays."""
         return self._format_dimension(context, self.depth)
 
+    def _format_truncated_depth(self, context):
+        """Format the physical axial span of a selected conic frustum."""
+        return self._format_dimension(context, self.truncated_depth)
+
     def _format_conic_angle(self):
-        """Format the conic half-angle for numeric input and overlays."""
+        """Format the full included conic tip angle for input and overlays."""
         return f"{math.degrees(self.conic_angle):.6g}°"
 
     def _parse_dimension(self, context, text):
@@ -1007,6 +1308,8 @@ class MESH_OT_holey_tools_resize_hole(
         active = getattr(self, "_active_dimension", 'DIAMETER')
         if active == 'DEPTH':
             return self.depth
+        if active == 'TRUNCATED_DEPTH':
+            return self.truncated_depth
         if active == 'ANGLE':
             return self.conic_angle
         return self.diameter
@@ -1016,8 +1319,10 @@ class MESH_OT_holey_tools_resize_hole(
         active = getattr(self, "_active_dimension", 'DIAMETER')
         if active == 'DEPTH':
             self.depth = value
+        elif active == 'TRUNCATED_DEPTH':
+            self.truncated_depth = value
         elif active == 'ANGLE':
-            self.conic_angle = min(math.radians(89.0), max(0.0, value))
+            self.conic_angle = min(math.radians(178.0), max(0.0, value))
         else:
             self.diameter = value
 
@@ -1034,6 +1339,11 @@ class MESH_OT_holey_tools_resize_hole(
             if active == 'DEPTH'
             else self._format_depth(context)
         ) if self.depth_valid else ""
+        self._truncated_depth_text = (
+            self._numeric_input
+            if active == 'TRUNCATED_DEPTH'
+            else self._format_truncated_depth(context)
+        ) if self.angle_valid and self.depth_valid else ""
         self._conic_angle_text = (
             self._numeric_input
             if active == 'ANGLE'
@@ -1044,11 +1354,17 @@ class MESH_OT_holey_tools_resize_hole(
         """Make a handle the target for subsequent typing, stepping, and drag."""
         if dimension == 'DEPTH' and not self.depth_valid:
             dimension = 'DIAMETER'
+        if dimension == 'TRUNCATED_DEPTH' and not (
+            self.angle_valid and self.depth_valid
+        ):
+            dimension = 'DIAMETER'
         if dimension == 'ANGLE' and not self.angle_valid:
             dimension = 'DIAMETER'
         self._active_dimension = dimension
         if dimension == 'DEPTH':
             self._numeric_reference = self._format_depth(context)
+        elif dimension == 'TRUNCATED_DEPTH':
+            self._numeric_reference = self._format_truncated_depth(context)
         elif dimension == 'ANGLE':
             self._numeric_reference = self._format_conic_angle()
         else:
@@ -1060,8 +1376,11 @@ class MESH_OT_holey_tools_resize_hole(
         self._tag_redraw(context)
 
     def _begin_numeric_input(self, context):
-        """Default direct entry to diameter until a handle is touched."""
-        self._activate_dimension(context, 'DIAMETER')
+        """Default direct entry to apex depth for cones, otherwise diameter."""
+        self._activate_dimension(
+            context,
+            'DEPTH' if self.angle_valid and self.depth_valid else 'DIAMETER',
+        )
 
     def _update_numeric_preview(self, context):
         """Apply valid input immediately to the mesh and GPU cone/cylinder.
@@ -1079,9 +1398,7 @@ class MESH_OT_holey_tools_resize_hole(
             self._sync_dimension_text(context)
             self._set_status_text(context)
             return
-        if value < 0.0 or (
-            self._active_dimension != 'ANGLE' and value <= 0.0
-        ):
+        if value < 0.0:
             self._sync_dimension_text(context)
             self._set_status_text(context)
             return
@@ -1099,7 +1416,7 @@ class MESH_OT_holey_tools_resize_hole(
             _system, scale = self._scene_unit_info(context)
             millimeters = 0.1 if fine_adjustment else 1.0
             step = millimeters * 0.001 / scale
-        minimum = 0.0 if self._active_dimension == 'ANGLE' else 1.0e-9
+        minimum = 0.0
         self._set_active_dimension_value(
             max(minimum, self._active_dimension_value() + direction * step)
         )
@@ -1185,6 +1502,54 @@ class MESH_OT_holey_tools_resize_hole(
         self._drag_start_x = event.mouse_x
         self._drag_start_y = event.mouse_y
         self._drag_start_value = self._active_dimension_value()
+        self._drag_input_value = None
+        self._drag_preview_pending = False
+        self._drag_preview_last_update = None
+        self._resize_wall_cache = None
+        MESH_OT_holey_tools_resize_hole._remove_drag_timer(self, context)
+        manager = getattr(context, "window_manager", None)
+        if manager is not None and hasattr(manager, "event_timer_add"):
+            self._drag_preview_timer = manager.event_timer_add(
+                _DRAG_PREVIEW_INTERVAL, window=context.window
+            )
+            _drag_timers.append((manager, self._drag_preview_timer))
+
+    def _remove_drag_timer(self, context):
+        """Release the drag wakeup on release, cancellation, or confirmation."""
+        timer = getattr(self, "_drag_preview_timer", None)
+        self._drag_preview_timer = None
+        self._drag_preview_pending = False
+        if timer is not None:
+            context.window_manager.event_timer_remove(timer)
+            _drag_timers[:] = [
+                (manager, active) for manager, active in _drag_timers
+                if active != timer
+            ]
+
+    def _flush_drag_preview(self, context, force=False):
+        """Apply only the latest dimensions, leaving time for input and drawing."""
+        if not getattr(self, "_drag_preview_pending", False):
+            # A Boolean update may have been deferred by its slower solver
+            # throttle. Catch up even if the pointer stops while held down.
+            if not getattr(self, "_boolean_preview_pending", False):
+                return
+            if (
+                not force
+                and time.monotonic() - getattr(self, "_boolean_preview_last_update", 0.0)
+                < _BOOLEAN_PREVIEW_INTERVAL
+            ):
+                return
+        last_update = getattr(self, "_drag_preview_last_update", None)
+        if (
+            not force and last_update is not None
+            and time.monotonic() - last_update < _DRAG_PREVIEW_INTERVAL
+        ):
+            return
+        self._drag_preview_pending = False
+        self._apply_diameter_to_mesh(context)
+        # Measure from completion, not start: a slow evaluation must not cause
+        # the next queued mouse event to immediately launch another evaluation.
+        self._drag_preview_last_update = time.monotonic()
 
     def _update_dimension_drag(self, context, event):
         """Convert handle-aligned drag distance into a live exponential resize.
@@ -1195,23 +1560,31 @@ class MESH_OT_holey_tools_resize_hole(
         """
         ui_scale = _ui_scale()
         active = self._active_dimension
-        if active == 'DEPTH':
+        if active in {'DEPTH', 'TRUNCATED_DEPTH'}:
             # Window-space Y increases upward, while dragging the depth handle
             # downward should make the hole deeper.
             delta = self._drag_start_y - event.mouse_y
         else:
             delta = event.mouse_x - self._drag_start_x
-        if abs(delta) >= 3.0 * ui_scale:
+        if abs(delta) >= 3.0 * max(1.0, ui_scale):
             self._drag_moved = True
+        if not self._drag_moved:
+            # Selection-click jitter and snapping must not edit a fitted value
+            # before the pointer has actually begun a drag.
+            return
         divisor = (1000.0 if event.shift else 200.0) * ui_scale
         if active == 'ANGLE':
             angle_divisor = (20.0 if event.shift else 4.0) * ui_scale
             value = self._drag_start_value + math.radians(delta / angle_divisor)
-            value = min(math.radians(89.0), max(0.0, value))
+            value = min(math.radians(178.0), max(0.0, value))
         else:
             value = self._drag_start_value * (2.0 ** (delta / divisor))
+            if self._drag_start_value == 0.0:
+                key = active.lower()
+                baseline = (getattr(self, "_modal_initial_dimensions", None) or {}).get(key, 1.0e-3)
+                value = max(0.0, baseline * (2.0 ** (delta / divisor) - 1.0))
         snap_enabled = bool(context.scene.tool_settings.use_snap) != bool(event.ctrl)
-        if snap_enabled:
+        if snap_enabled and delta != 0.0:
             if active == 'ANGLE':
                 snap_step = math.radians(0.1)
             else:
@@ -1221,7 +1594,18 @@ class MESH_OT_holey_tools_resize_hole(
                 snap_step = 0.0001 / scale
             value = round(value / snap_step) * snap_step
             value = max(0.0 if active == 'ANGLE' else snap_step, value)
-        self._set_active_dimension_value(max(0.0 if active == 'ANGLE' else 1.0e-9, value))
+        value = max(0.0, value)
+        current_value = self._active_dimension_value()
+        if (
+            value == getattr(self, "_drag_input_value", None)
+            and current_value == getattr(self, "_drag_stored_value", None)
+        ) or math.isclose(value, current_value, rel_tol=1.0e-12, abs_tol=1.0e-12):
+            return
+        self._set_active_dimension_value(value)
+        # RNA stores FloatProperty values at lower precision than the drag
+        # calculation. Compare repeated input to its last stored value too.
+        self._drag_input_value = value
+        self._drag_stored_value = self._active_dimension_value()
         self._numeric_reference = (
             self._format_conic_angle()
             if active == 'ANGLE'
@@ -1231,11 +1615,12 @@ class MESH_OT_holey_tools_resize_hole(
         self._numeric_replace = True
         self._sync_dimension_text(context)
         self._build_cylinder_preview(context)
-        self._apply_diameter_to_mesh(context)
+        self._drag_preview_pending = True
+        MESH_OT_holey_tools_resize_hole._flush_drag_preview(self, context)
         self._set_status_text(context)
 
     def _lock_selection_and_fit(self, context, build_preview=True):
-        """Commit the hover region and initialize dimension-editing state.
+        """Commit the candidate wall region and initialize dimension-editing state.
 
         The method fits the circular cone and boundary planes, makes the candidate
         faces Blender's real selection, captures original/proportional vertex
@@ -1265,9 +1650,24 @@ class MESH_OT_holey_tools_resize_hole(
         self._resize_dynamic_requires_boolean = False
         self._build_resize_projection_state(bm, faces)
         selected_verts = {vert for face in faces for vert in face.verts}
+        bm.verts.ensure_lookup_table()
+        selected_verts.update(
+            bm.verts[index]
+            for index in getattr(
+                self, "_resize_bore_vertex_indices", set()
+            )
+            if index < len(bm.verts)
+        )
         self._capture_deformation_state(context, bm, selected_verts)
         self._store_fit_for_redo()
+        self._modal_initial_dimensions = {
+            "diameter": float(self.diameter),
+            "depth": float(self.depth),
+            "truncated_depth": float(self.truncated_depth),
+            "conic_angle": float(self.conic_angle),
+        }
         self._stage = 'CYLINDER'
+        self._hover_cache = self._hover_region = self._hover_preview_region = None
         self._begin_numeric_input(context)
         if build_preview:
             self._build_cylinder_preview(context)
@@ -1298,20 +1698,8 @@ class MESH_OT_holey_tools_resize_hole(
     @staticmethod
     def _reset_execute_transients(operator):
         """Discard mesh-derived state before rebuilding a Redo execution."""
-        operator._fit = None
-        operator._end_planes = None
-        operator._depth_fit = None
-        operator._locked_indices = set()
-        operator._original_vertex_coords = None
-        operator._proportional_weights = None
-        operator._resize_projection_ready = False
-        operator._resize_requires_boolean = False
-        operator._resize_base_requires_boolean = False
-        operator._resize_dynamic_requires_boolean = False
-        operator._resize_surfaces_by_vertex = {}
-        operator._resize_base_bvh = None
-        operator._resize_base_span = 0.0
-        operator._resize_angular_segments = 0
+        reset_mesh_derived_state(operator)
+        GeometryMixin._resolve_resize_method(operator)
 
     def execute(self, context):
         """Apply stored dimensions during confirmation or Redo execution.
@@ -1329,6 +1717,9 @@ class MESH_OT_holey_tools_resize_hole(
         ):
             self.report({'WARNING'}, "Use Resize Hole in Mesh Edit Mode")
             return {'CANCELLED'}
+
+        if _persistent_preview is not None:
+            _persistent_preview.restore_source(active_object)
 
         object_changed = MESH_OT_holey_tools_resize_hole._bind_execute_object(
             self, active_object
@@ -1360,9 +1751,17 @@ class MESH_OT_holey_tools_resize_hole(
             # through modal input. Keep both overlay values synchronized.
             if (
                 (self._active_dimension == 'DEPTH' and not self.depth_valid)
+                or (
+                    self._active_dimension == 'TRUNCATED_DEPTH'
+                    and not (self.angle_valid and self.depth_valid)
+                )
                 or (self._active_dimension == 'ANGLE' and not self.angle_valid)
             ):
-                self._active_dimension = 'DIAMETER'
+                self._active_dimension = (
+                    'DEPTH'
+                    if self.angle_valid and self.depth_valid
+                    else 'DIAMETER'
+                )
             self._numeric_input = (
                 self._format_conic_angle()
                 if self._active_dimension == 'ANGLE'
@@ -1374,6 +1773,20 @@ class MESH_OT_holey_tools_resize_hole(
             _persistent_preview.update_from(self, context)
         return {'FINISHED'}
 
+    def cancel(self, context):
+        """Rollback an abandoned modal operation, including extension cleanup."""
+        if getattr(self, '_runtime_cancelled', False):
+            return
+        self._runtime_cancelled = True
+        try:
+            self._restore_original_geometry()
+            self._restore_initial_selection()
+        finally:
+            try:
+                GeometryMixin._discard_boolean_preview_source(self)
+            finally:
+                self._finish_modal(context)
+
     def modal(self, context, event):
         """Route View3D events through selection and cylinder-editing stages.
 
@@ -1382,10 +1795,10 @@ class MESH_OT_holey_tools_resize_hole(
         operator execution. Pointer dragging can begin with the selecting click
         or with any later press on the on-screen gizmo.
         """
+        if getattr(self, '_runtime_cancelled', False):
+            return {'CANCELLED'}
         if context.area is None or context.area.type != 'VIEW_3D':
-            self._restore_original_geometry()
-            self._restore_initial_selection()
-            self._finish_modal(context)
+            MESH_OT_holey_tools_resize_hole.cancel(self, context)
             return {'CANCELLED'}
 
         region = getattr(self, "_region", None)
@@ -1406,6 +1819,17 @@ class MESH_OT_holey_tools_resize_hole(
         # handling. Trackpad gestures and NDOF events are continuous event
         # streams, rather than aliases for the mouse wheel or middle button.
         if _is_view_navigation_event(event.type) or event.type == 'Z':
+            return {'PASS_THROUGH'}
+
+        if event.type == 'TIMER':
+            timer = getattr(self, "_drag_preview_timer", None)
+            if (
+                self._stage == 'CYLINDER'
+                and self._drag_active
+                and timer is not None
+                and getattr(event, "timer", None) == timer
+            ):
+                MESH_OT_holey_tools_resize_hole._flush_drag_preview(self, context)
             return {'PASS_THROUGH'}
 
         if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
@@ -1438,9 +1862,7 @@ class MESH_OT_holey_tools_resize_hole(
             return {'RUNNING_MODAL'}
 
         elif event.type in {'RIGHTMOUSE', 'ESC'}:
-            self._restore_original_geometry()
-            self._restore_initial_selection()
-            self._finish_modal(context)
+            MESH_OT_holey_tools_resize_hole.cancel(self, context)
             return {'CANCELLED'}
 
         elif (
@@ -1450,9 +1872,14 @@ class MESH_OT_holey_tools_resize_hole(
             and self._drag_active
         ):
             self._drag_active = False
-            if getattr(self, "_boolean_preview_pending", False):
-                self._apply_diameter_to_mesh(context)
-                self._set_status_text(context)
+            # Dropping the drag flag bypasses the Boolean throttle as well.
+            self._drag_preview_pending = bool(
+                getattr(self, "_drag_preview_pending", False)
+                or getattr(self, "_boolean_preview_pending", False)
+            )
+            MESH_OT_holey_tools_resize_hole._flush_drag_preview(self, context, force=True)
+            MESH_OT_holey_tools_resize_hole._remove_drag_timer(self, context)
+            self._resize_wall_cache = None
             return {'RUNNING_MODAL'}
 
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
@@ -1462,17 +1889,23 @@ class MESH_OT_holey_tools_resize_hole(
                 self._update_hover(context, event)
                 if not self._lock_selection_and_fit(context, build_preview=True):
                     return {'RUNNING_MODAL'}
-                self._begin_dimension_drag(context, event, 'DIAMETER')
+                self._begin_dimension_drag(
+                    context, event, self._active_dimension
+                )
                 return {'RUNNING_MODAL'}
             touched_dimension = self._dimension_gizmo_at_event(event)
             if touched_dimension is not None:
                 self._begin_dimension_drag(context, event, touched_dimension)
                 return {'RUNNING_MODAL'}
+            if self._cancel_unchanged_modal(context):
+                return {'CANCELLED'}
             self._end_modal_with_persistent_preview(context)
             return self.execute(context)
 
         elif event.type in {'RET', 'NUMPAD_ENTER'} and event.value == 'PRESS':
             if self._stage == 'CYLINDER':
+                if self._cancel_unchanged_modal(context):
+                    return {'CANCELLED'}
                 self._end_modal_with_persistent_preview(context)
                 return self.execute(context)
 
@@ -1493,7 +1926,8 @@ class MESH_OT_holey_tools_resize_hole(
         Every invocation starts at scale one with no fitted diameter. Existing
         persistent drawing is retired, source selection is captured, and the
         View3D WINDOW region is saved because panel invocation supplies a sidebar
-        context. A selected face seeds an immediate preview when available.
+        context. A selected face seeds an immediate preview when available;
+        Ctrl/Cmd invocation instead locks the exact visible face selection.
         """
         global _modal_active, _persistent_preview
         if not self.poll(context):
@@ -1501,39 +1935,46 @@ class MESH_OT_holey_tools_resize_hole(
             return {'CANCELLED'}
 
         self._object = context.active_object
+        self._runtime_cancelled = False
+        self._hover_cache = self._hover_region = self._hover_preview_region = None
+        bm = bmesh.from_edit_mesh(self._object.data)
+        bm.faces.ensure_lookup_table()
+        use_selection = bool(getattr(event, "ctrl", False) or getattr(event, "oskey", False))
+        selected_faces = [face for face in bm.faces if face.select and not face.hide]
+        if use_selection and not selected_faces:
+            self.report({'WARNING'}, "Select cylindrical or conical wall faces before Ctrl/Cmd-clicking Resize Hole")
+            return {'CANCELLED'}
 
         # A prior fitted preview belongs to the previous last operation.
         if _persistent_preview is not None:
             _persistent_preview.remove()
             _persistent_preview = None
-        bm = bmesh.from_edit_mesh(self._object.data)
-        bm.faces.ensure_lookup_table()
-        self._bvh = BVHTree.FromBMesh(bm)
+        self._bvh, self._bvh_faces = (None, ()) if use_selection else visible_bvh(bm)
         self._initial_selection = {face.index for face in bm.faces if face.select}
-        self._original_vertex_coords = None
-        self._proportional_weights = None
+        reset_mesh_derived_state(self)
         self._candidate_indices = set()
-        self._locked_indices = set()
         self._hover_face_index = -1
-        self._fit = None
-        self._end_planes = None
-        self._depth_fit = None
-        self._resize_projection_ready = False
-        self._resize_requires_boolean = False
-        self._resize_dynamic_requires_boolean = False
-        self._resize_surfaces_by_vertex = {}
-        self._resize_base_bvh = None
-        self._resize_base_span = 0.0
-        self._resize_angular_segments = 0
+        self._modal_initial_dimensions = None
         self._boolean_preview_source = None
+        self._boolean_reconstruction_source = None
+        self._boolean_reconstruction_blind_coordinates = None
+        self._boolean_preview_display_object = None
+        self._boolean_preview_cutter_object = None
+        self._boolean_preview_modifier_name = ""
         self._boolean_preview_segments = 0
         self._boolean_preview_last_update = 0.0
         self._boolean_preview_pending = False
+        self.fit_valid = False
         self.scale = 1.0
         self.diameter = 0.0
         self.depth = 0.0
+        self.truncated_depth = 0.0
+        self.conic_depth_previous = 0.0
+        self.conic_truncated_depth_previous = 0.0
+        self.conic_angle_previous = 0.0
         self.conic_angle = 0.0
-        self.fit_valid = False
+        # Keep the mode supplied by the sidebar button (or an explicit caller).
+        self.scaling_final_simplify = False
         self.fit_angular_segments = 0
         self.boolean_segments = 32
         self.depth_valid = False
@@ -1546,21 +1987,30 @@ class MESH_OT_holey_tools_resize_hole(
         self.fit_depth_outer = 0.0
         self.fit_depth_inner = 0.0
         self.fit_depth_outer_plane = 0
+        self.fit_conic_depth_initial = 0.0
+        self.fit_truncated_depth_initial = 0.0
+        self.fit_conic_bottom_radius = 0.0
         self.fit_face_indices = ""
         self.fit_end_planes = ""
         self.reconstruction_result_method = ""
         self.reconstruction_result_fill_style = ""
+        self.reconstruction_grid_edge_length = 0.0
         self._stage = 'SELECT'
         self._numeric_input = ""
         self._numeric_reference = ""
         self._numeric_replace = True
         self._diameter_text = ""
         self._depth_text = ""
+        self._truncated_depth_text = ""
         self._conic_angle_text = ""
         self._active_dimension = 'DIAMETER'
         self._angle_numeric_input = f"{math.degrees(self.flood_angle):.1f}"
         self._angle_numeric_replace = True
         self._drag_active = False
+        self._drag_preview_timer = None
+        self._drag_preview_pending = False
+        self._drag_preview_last_update = None
+        self._resize_wall_cache = None
         self._drag_moved = False
         self._gizmo_rect = None
         self._gizmo_rects = {}
@@ -1583,6 +2033,15 @@ class MESH_OT_holey_tools_resize_hole(
             event.mouse_y - self._region.y,
         )
 
+        if use_selection:
+            self._candidate_indices = {face.index for face in selected_faces}
+            if not self._lock_selection_and_fit(context, build_preview=False):
+                self._restore_initial_selection()
+                _modal_active = False
+                context.workspace.status_text_set(None)
+                return {'CANCELLED'}
+
+        begin_modal_session(self, context)
         self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
             self._draw_preview, (), 'WINDOW', 'POST_PIXEL'
         )
@@ -1593,25 +2052,33 @@ class MESH_OT_holey_tools_resize_hole(
         # A panel button cannot provide a mesh-space hover coordinate. Seed the
         # first GPU preview from the active selected face (or any selected face),
         # then let mouse hover take over once it enters the viewport.
-        selected_faces = [face for face in bm.faces if face.select and not face.hide]
-        active_face = bm.faces.active
-        if active_face is not None and active_face in selected_faces:
-            self._set_hover_seed(context, active_face)
-        elif selected_faces:
-            self._set_hover_seed(context, selected_faces[0])
-
-        self._update_hover(context, event)
+        if use_selection:
+            self._build_cylinder_preview(context)
+        else:
+            active_face = bm.faces.active
+            if active_face is not None and active_face in selected_faces:
+                self._set_hover_seed(context, active_face)
+            elif selected_faces:
+                self._set_hover_seed(context, selected_faces[0])
+            self._update_hover(context, event)
         self._set_status_text(context)
         return {'RUNNING_MODAL'}
 
 
 def cleanup_runtime():
-    """Remove every runtime draw handler during extension unregistration.
+    """Cancel live sessions and release preview, timer, and drawing resources.
 
-    Tracking handlers independently of operator RNA objects makes cleanup safe
-    after script reloads and after Blender has invalidated completed operators.
+    Live operators are owned only until cancellation/confirmation. Completed
+    operators are never retained; their redo drawing has its separate owner.
     """
     global _modal_active, _persistent_preview
+    cancel_modal_sessions()
+    for manager, timer in _drag_timers:
+        try:
+            manager.event_timer_remove(timer)
+        except (ReferenceError, ValueError):
+            pass
+    _drag_timers.clear()
     if _persistent_preview is not None:
         _persistent_preview.remove()
         _persistent_preview = None

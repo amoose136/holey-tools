@@ -19,9 +19,11 @@ copyright = [
 [build]
 paths_exclude_pattern = [
   "__pycache__/",
+  ".DS_Store",
   "/.git/",
   "/*.zip",
   "*.md",
+  "*.blend",
   "docs",
   "LICENSE",
 ]
