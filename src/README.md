@@ -1,4 +1,4 @@
-# Holey Tools
+# Holey Tools 🧀
 
 Holey Tools provides precision mesh-editing tools for holes with **Resize Hole** and **Fair Hole**.
 
