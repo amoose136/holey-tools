@@ -2,11 +2,6 @@
 
 Holey Tools provides precision mesh-editing tools for holes with **Resize Hole** and **Fair Hole**.
 
-## Requirements
-
-- Blender 5.2 or newer
-- A mesh object in Edit Mode.
-
 ## Resize Hole
 
 1. Open **3D Viewport > Sidebar > Holey Tools**.
@@ -50,10 +45,10 @@ Hidden faces are excluded from picking, fitting, surface projection, fairing pro
 
 - Resize Hole operates on one connected hole wall at a time.
 - The selected wall must contain enough geometry to define a stable circular-cone axis and radial regression.
-- Minimum and maximum estimates are sensitive to genuinely irregular wall vertices.
+- Minimum and maximum estimates are sensitive to genuinely irregular wall vertices. IE they must be on smoothly varying surface without discontinuities.
 - Depth adjustment requires either two usable planar end arcs or distinct exterior and blind-cap surfaces that both intersect the fitted axis.
 - Cylindrical through-holes expose diameter only; conical regions with two recoverable end circles expose theoretical apex depth, physical truncation depth, and included tip angle.
-- Counterbore holes are not (yet) supported.
+- Counterbore holes are not (yet) supported as a single operation but one can handle them in two steps.
 - Boolean reconstruction requires at least one recoverable closed exterior rim; branched or irrecoverably fragmented non-planar boundaries are rejected rather than deformed directly.
 
 ## Fair Hole
