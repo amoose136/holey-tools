@@ -1,6 +1,6 @@
 # Holey Tools
 
-Holey Tools provides precision mesh-editing tools for holes. Version 0.9 contains **Resize Hole** and **Fair Hole**.
+Holey Tools provides precision mesh-editing tools for holes with **Resize Hole** and **Fair Hole**.
 
 ## Requirements
 

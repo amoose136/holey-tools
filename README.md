@@ -4,6 +4,7 @@ Holey Tools is a Blender 5.2+ extension for editing mesh holes to precise physic
 
 ## Documentation
 
+- [Version 1.0 release notes](RELEASE_NOTES.md)
 - [User guide](src/README.md)
 - [Architecture](src/docs/architecture.md)
 - [Resize Hole workflow](src/docs/resize-hole-workflow.md)
