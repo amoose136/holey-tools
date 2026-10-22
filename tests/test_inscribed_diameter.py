@@ -1,4 +1,4 @@
-"""Blind polygonal bores retain their usable diameter across cutter resolutions."""
+"""Blind and through bores retain usable diameter across cutter resolutions."""
 
 import math
 import sys
@@ -10,31 +10,23 @@ import bpy
 from mathutils import Vector
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.operator import MESH_OT_holey_tools_resize_hole as Resize, _PersistentPreview
+from src.operator import MESH_OT_holey_tools_resize_hole as Resize
 from src.resize_dimensions import _update_diameter_estimator
+from tests.blender_support import capture_redo_source, edit_mesh
 
 
-def fixture(count):
-    if bpy.context.object and bpy.context.object.mode == 'EDIT':
-        bpy.ops.object.mode_set(mode='OBJECT')
-    for obj in bpy.context.selected_objects:
-        obj.select_set(False)
+def fixture(count, through=False):
     vertices = [(r * math.cos(math.tau * i / count), r * math.sin(math.tau * i / count), z)
-                for r, z in ((4, 1), (1, 1), (1, -1), (4, -2)) for i in range(count)]
+                for r, z in ((4, 1), (1, 1), (1, -2 if through else -1), (4, -2))
+                for i in range(count)]
     faces = []
-    for a, b in ((0, 1), (1, 2), (3, 0)):
+    for a, b in (((0, 1), (1, 2), (3, 0), (2, 3)) if through else ((0, 1), (1, 2), (3, 0))):
         for i in range(count):
             j = (i + 1) % count
             faces.append((a * count + i, a * count + j, b * count + j, b * count + i))
-    faces.extend((tuple(range(2 * count, 3 * count)), tuple(reversed(range(3 * count, 4 * count)))))
-    mesh = bpy.data.meshes.new('Blind polygonal bore')
-    mesh.from_pydata(vertices, (), faces)
-    obj = bpy.data.objects.new(mesh.name, mesh)
-    bpy.context.collection.objects.link(obj)
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-    bpy.ops.object.mode_set(mode='EDIT')
-    bm = bmesh.from_edit_mesh(mesh)
+    if not through:
+        faces.extend((tuple(range(2 * count, 3 * count)), tuple(reversed(range(3 * count, 4 * count)))))
+    obj, bm = edit_mesh('Blind polygonal bore', vertices, faces)
     bm.normal_update()
     bm.faces.ensure_lookup_table()
     wall = list(bm.faces[count:2 * count])
@@ -52,19 +44,16 @@ def fixture(count):
     Resize._build_resize_projection_state(op, bm, wall)
     Resize._capture_deformation_state(op, bpy.context, bm, {v for f in wall for v in f.verts})
     Resize._store_fit_for_redo(op)
-    owner = object.__new__(_PersistentPreview)
-    owner._draw_handle = None
-    owner._source_object_name = obj.name
-    (owner._source_mesh_name, owner._source_mesh, owner._source_bmesh,
-     owner._source_materials) = _PersistentPreview._capture_canonical_source(op)
+    owner = capture_redo_source(op)
     return obj, op, owner
 
 
-for source_count in (3, 4, 8, 32):
-    obj, op, owner = fixture(source_count)
+for source_count, through in ((n, through) for n in (3, 4, 8, 32) for through in (False, True)):
+    obj, op, owner = fixture(source_count, through)
     inside = math.cos(math.pi / source_count)
     assert op.fit_angular_segments == source_count
-    assert op.depth_valid and not op.fit_is_stud and not op.fit_is_cone
+    assert op.depth_valid == (not through)
+    assert not op.fit_is_stud and not op.fit_is_cone
     assert abs(op.diameter - 2 * inside) < 1.0e-6
     assert abs(Resize._target_scale(op) - 1) < 1.0e-6
     original = [v.co.copy() for v in bmesh.from_edit_mesh(obj.data).verts]

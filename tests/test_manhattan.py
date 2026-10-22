@@ -8,6 +8,7 @@ from mathutils import Matrix, Vector
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.fairing import FairingError, _signed_area_2d, ordered_boundary_loop
 from src.manhattan import analyze_boundary, grid_layout
+from src.grid_quality import shape_loss
 from src.row_patcher import fill_refined_rows
 
 
@@ -44,7 +45,7 @@ def check(layout, points):
                - _signed_area_2d([Vector(p) for p in points])) < 1e-5
     assert all(coords[i] == Vector(p) for i, p in enumerate(points))
     for row, counts in zip(layout['row_faces'], layout['row_edge_counts']):
-        assert abs(counts[0] - counts[1]) in {0, 2}
+        assert abs(counts[0] - counts[1]) in {0, 1, 2}
         # Mutation vertices belong to this row alone, never a two-row patch.
         others = {i for other in layout['row_faces'] if other is not row for face in other for i in face}
         unique = {i for face in row for i in face} - others - set(range(len(points)))
@@ -85,7 +86,8 @@ relaxed = grid_layout(POINTS, VALENCES, WORLD, relaxation_iterations=20)
 assert raw['row_faces'] == relaxed['row_faces'] and raw['splits'] == relaxed['splits']
 assert relaxed['relaxation_passes'] > 0 and raw['relaxation_passes'] == 0
 print('RELAXATION_ENERGY', edge_energy(raw), edge_energy(relaxed), flush=True)
-assert edge_energy(relaxed) < edge_energy(raw)
+print('RELAXATION_SHAPE_LOSS', shape_loss(raw), shape_loss(relaxed), flush=True)
+assert shape_loss(relaxed) < shape_loss(raw)
 assert max((a - b).length for a, b in zip(raw['coords'], relaxed['coords'])) > 1e-3
 disabled = grid_layout(POINTS, VALENCES, WORLD, relaxation_strength=0.)
 assert disabled['coords'] == raw['coords']
@@ -100,7 +102,10 @@ def rectangle(bottom=4, top=4, left=4, right=4):
 for counts in ((4, 4, 4, 4), (8, 2, 5, 5), (5, 4, 4, 4), (8, 2, 3, 5)):
     points = rectangle(*counts)
     layout = check(grid_layout(points, [3] * len(points)), points)
-    assert len(layout['splits']) == (1 if counts == (5, 4, 4, 4) else 2 if counts == (8, 2, 3, 5) else 0)
+    assert len(layout['splits']) == (1 if counts == (5, 4, 4, 4) else 0)
+    if counts == (8, 2, 3, 5):
+        assert layout['mutations'] >= 2
+        assert any(abs(a - b) == 1 for a, b in layout['row_edge_counts'])
     for edge, factor, identity in layout['splits']:
         assert 0 < factor < 1 and identity >= len(points)
         assert (layout['coords'][identity] - Vector(points[edge]).lerp(Vector(points[(edge + 1) % len(points)]), factor)).length < 1e-7
@@ -134,19 +139,26 @@ for curved in (False, True):
             for face in source_faces:
                 for corner in face.loops:
                     corner[uv].uv = corner.vert.co.xy
-            result = fill_refined_rows(bm, loop, edges, Matrix.Identity(4),
-                                       fill_rows=partial)
-            assert all(v.is_valid and v.co == co for v, co in original.items())
+            try:
+                result = fill_refined_rows(bm, loop, edges, Matrix.Identity(4),
+                                           fill_rows=partial)
+            except FairingError as error:
+                raise AssertionError((curved, counts, partial)) from error
+            assert all(v.is_valid and v.co == co for v, co in original.items() if v not in loop)
             assert all(face.is_valid for face in source_faces)
-            assert all((corner[uv].uv - corner.vert.co.xy).length < 1e-6
+            assert all((corner[uv].uv - original.get(corner.vert, corner.vert.co).xy).length < 1e-6
                        for face in source_faces for corner in face.loops)
             assert all(face.material_index == 2 and face.smooth for face in result['faces'])
             assert all(len(face.verts) == 4 and face.calc_area() > 1e-8 for face in result['faces'])
             assert all(len(e.link_faces) in {1, 2} for e in bm.edges)
             # Required cuts remain exactly on the original 3D boundary edges;
-            # only brand-new interior points receive the surface projection.
+            # their source endpoints are pinned during refined-rim relaxation.
             cuts = set(result['boundary_verts']) - set(loop)
             assert len(cuts) == result['grid_cut_count']
+            if len(loop) % 2 == 0:
+                assert not cuts
+                assert all(len(face.verts) == 4 for face in source_faces)
+                assert all(edge.is_valid for edge in edges)
             for v in cuts:
                 assert any((v.co - a.co).cross(b.co - a.co).length < 1e-6
                            and 0 < (v.co - a.co).dot(b.co - a.co) < (b.co - a.co).length_squared
@@ -171,10 +183,10 @@ for partial in (0, 1, 2):
     source = {v: v.co.copy() for v in bm.verts}
     result = fill_refined_rows(bm, loop, edges, Matrix.Identity(4), fill_rows=partial)
     assert result['surface_continuity'] == 'C2_ESTIMATED'
-    for v in result['verts']:
+    for v in result['verts'] + loop:
         offset = v.co - center
         assert abs(offset.dot(axis) - surface([(offset.dot(x), offset.dot(y))])[0]) < 1e-6
-    assert all(v.co == p for v, p in source.items())
+    assert all(v.co == p for v, p in source.items() if v not in loop)
     bm.free()
 
 import src
@@ -207,6 +219,7 @@ obj = bpy.data.objects.new(mesh.name, mesh); bpy.context.collection.objects.link
 bpy.context.view_layer.objects.active = obj; obj.select_set(True)
 bpy.ops.object.mode_set(mode='EDIT')
 op = SimpleNamespace(edge_indices=indices, fill_style='GRID', grid_step='ROWS',
+                     fairing_method='ORGANIC',
                      report=lambda _level, message: print(message, flush=True))
 assert MESH_OT_holey_tools_fair_hole.execute(op, bpy.context) == {'FINISHED'}
 assert op.result_grid_row_method == 'MANHATTAN_GRID'
@@ -215,8 +228,8 @@ bpy.ops.object.mode_set(mode='OBJECT')
 src.unregister()
 
 
-# Reject inconsistent labels, folds, and disconnected strip templates without
-# mutating any input data or falling back to another backend.
+# Reject inconsistent labels and folds without mutating any input data or
+# falling back to another backend.
 for points, valences in (([(0, 0), (1, 0), (1, 1), (0, 1)], [2] * 4),
                           ([(0, 0), (0, 0), (1, 1), (0, 1)], [3] * 4)):
     try:
@@ -234,11 +247,26 @@ valences = []
 for i, p in enumerate(map(Vector, u_shape)):
     incoming, outgoing = p - Vector(u_shape[i - 1]), Vector(u_shape[(i + 1) % len(u_shape)]) - p
     valences.append(2 if incoming.x * outgoing.y - incoming.y * outgoing.x < 0 else 3)
+layout = check(grid_layout(u_shape, valences), u_shape)
+assert layout['sweep_rotation'] == 1
+
+# Two notches in perpendicular sides split rows in both sweep directions.
+# They must still be rejected rather than connected across completed mesh.
+corners = [(0, 0), (6, 0), (6, 1), (3, 1), (3, 2), (6, 2),
+           (6, 6), (2, 6), (2, 3), (1, 3), (1, 6), (0, 6)]
+notched = []
+for a, b in zip(corners, corners[1:] + corners[:1]):
+    count = abs(b[0] - a[0]) + abs(b[1] - a[1])
+    notched.extend(Vector(a).lerp(Vector(b), i / count) for i in range(count))
+valences = []
+for i, p in enumerate(notched):
+    incoming, outgoing = p - notched[i - 1], notched[(i + 1) % len(notched)] - p
+    valences.append(2 if incoming.x * outgoing.y - incoming.y * outgoing.x < 0 else 3)
 try:
-    grid_layout(u_shape, valences)
+    grid_layout(notched, valences)
 except FairingError as error:
     assert 'connected interval' in str(error)
 else:
-    raise AssertionError('Disconnected Manhattan rows accepted')
+    raise AssertionError('Rows disconnected in both sweep directions accepted')
 
 print('HOLEY_TOOLS_MANHATTAN_OK', flush=True)

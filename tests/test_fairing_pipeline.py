@@ -3,6 +3,7 @@ import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import bmesh
 import bpy
@@ -135,6 +136,17 @@ finally:
     pipeline.prepare_grid_steps = prepare_grid
 
 # Defaults, preselection reset, and development-only UI controls.
+obj, bm, loop, edges = fixture()
+next(face for face in bm.faces if not any(edge in edges for edge in face.edges)).hide = True
+with patch.object(pipeline, 'visible_bmesh_copy', side_effect=ValueError('copy failed')):
+    assert pipeline._probe_grid_patch(obj, bm, edges, {}) == 'copy failed'
+# Mapping failure also frees an already allocated copy before Auto fallback.
+trial = bmesh.new()
+with patch.object(pipeline, 'visible_bmesh_copy', return_value=(trial, {}, {}, {})):
+    assert pipeline._probe_grid_patch(obj, bm, edges, {}) is not None
+assert not trial.is_valid
+
+# Defaults, preselection reset, and development-only UI controls.
 src.register()
 props = bpy.ops.mesh.holey_tools_fair_hole.get_rna_type().properties
 assert props['fill_style'].default == props['fairing_method'].default == 'AUTO'
@@ -163,24 +175,37 @@ MESH_OT_holey_tools_fair_hole._reset_invocation_defaults(op, scene)
 assert (op.fill_style, op.fairing_method) == ('GRID', 'SPHERE')
 
 class Layout:
-    def __init__(self): self.controls = []
+    def __init__(self): self.controls, self.labels = [], []
     def prop(self, obj, name): self.controls.append(name)
-    def label(self, **kwargs): pass
+    def label(self, **kwargs): self.labels.append(kwargs['text'])
     def separator(self): pass
 layout = Layout()
 op = SimpleNamespace(layout=layout, fill_style='AUTO', result_fill_style='GRID',
-                     result_method='GRID_ROWS')
+                     result_method='GRID_ROWS', result_grid_surface_continuity='INTRINSIC_BENDING')
 MESH_OT_holey_tools_fair_hole.draw(op, bpy.context)
 assert layout.controls == ['fairing_method', 'fill_style', 'grid_match_curvature']
+assert 'Surface: 3D bending continuation (folded chart)' in layout.labels
+layout = Layout()
+op = SimpleNamespace(layout=layout, fill_style='GRID', result_fill_style='GRID',
+                     result_method='SPHERE', result_residual=.01, result_grid_surface_continuity='ANALYTIC')
+MESH_OT_holey_tools_fair_hole.draw(op, bpy.context)
+assert layout.controls == ['fairing_method', 'fill_style']
+layout = Layout()
+op = SimpleNamespace(layout=layout, fill_style='CIRCLE', result_fill_style='CIRCLE',
+                     result_method='ORGANIC', result_grid_surface_continuity='INTRINSIC_BENDING')
+MESH_OT_holey_tools_fair_hole.draw(op, bpy.context)
+assert layout.controls == ['fairing_method', 'fill_style', 'circle_loops', 'final_simplify']
+assert 'Surface: 3D bending continuation (folded chart)' in layout.labels
 
 # Even stale development redo values cannot leave a partial production patch.
 obj, bm, loop, edges = fixture()
 bm.edges.index_update()
 op = SimpleNamespace(edge_indices=','.join(str(e.index) for e in edges),
                      fill_style='GRID', grid_step='DISSOLVE', grid_fill_rows=1,
+                     fairing_method='ORGANIC',
                      grid_relaxation_iterations=0, report=lambda *_args: None)
 assert MESH_OT_holey_tools_fair_hole.execute(op, bpy.context) == {'FINISHED'}
-assert op.result_method == 'GRID_ROWS'
+assert op.result_method == 'ORGANIC'
 assert op.result_grid_rows_filled == op.result_grid_rows_total
 assert op.result_grid_relaxation_passes > 0
 src.unregister()

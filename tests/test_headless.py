@@ -432,16 +432,25 @@ assert operator._resize_angular_segments == 16
 
 # Exercise the extracted GPU-preview geometry builder without requiring a window.
 operator.diameter = 0.0
-operator._fill_batch = None
-operator._line_batch = None
 operator._tag_redraw = lambda _context: None
 MESH_OT_holey_tools_resize_hole._build_cylinder_preview(operator, bpy.context)
-assert len(operator._fill_coords) == 16 * 2, len(operator._fill_coords)
-assert len(operator._line_coords) == 16 * 2, len(operator._line_coords)
-operator.boolean_segments = 9
+assert len(operator._fill_coords) == 128 * 2, len(operator._fill_coords)
+assert len(operator._line_coords) == 128 * 2, len(operator._line_coords)
+smooth_lines = operator._line_coords
+for source_count, cutter_count, live_count in ((3, 3, 3), (4, 9, 32), (512, 512, 32)):
+    operator._resize_angular_segments = source_count
+    operator.boolean_segments = cutter_count
+    operator._boolean_preview_segments = live_count
+    MESH_OT_holey_tools_resize_hole._build_cylinder_preview(operator, bpy.context)
+    assert len(operator._fill_coords) == 128 * 2
+    assert operator._line_coords == smooth_lines
+# Conic geometry uses the same smooth overlay independently of its cutter.
+operator._target_radius_at = lambda coordinate: 2.0 + .1 * coordinate
 MESH_OT_holey_tools_resize_hole._build_cylinder_preview(operator, bpy.context)
-assert len(operator._fill_coords) == 9 * 2, len(operator._fill_coords)
-assert len(operator._line_coords) == 9 * 2, len(operator._line_coords)
+assert len(operator._fill_coords) == len(operator._line_coords) == 128 * 2
+del operator._target_radius_at
+operator._resize_angular_segments = 16
+operator._boolean_preview_segments = 0
 operator.boolean_segments = 16
 
 # Reconstruction depth fixes the preview at the fitted exterior-surface basis

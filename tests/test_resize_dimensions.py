@@ -61,10 +61,20 @@ class ResizeDimensionsTests(unittest.TestCase):
 
     def test_polygon_correction_leaves_other_dimension_conventions_unchanged(self):
         for fit, depth in (({'is_cone': True}, {'initial': 1}),
-                           ({'is_stud': True}, {'initial': 1}),
-                           ({'is_cone': False}, None)):
+                           ({'is_stud': True}, {'initial': 1})):
             op = SimpleNamespace(_fit=fit, _depth_fit=depth, fit_angular_segments=4)
             self.assertEqual(dimensions._cylinder_inradius_factor(op), 1.0)
+
+    def test_through_bore_keeps_correction_without_depth_controls(self):
+        op = SimpleNamespace(
+            _fit={'radius': 1.0, 'slope': 0.0, 'is_cone': False, 'is_stud': False},
+            _depth_fit=None, depth_valid=False, fit_angular_segments=32,
+            diameter=2.0, scale=1.0, angle_valid=False,
+        )
+        for count in (3, 4, 8, 32, 128):
+            self.assertAlmostEqual(Dimensions._preview_radius_at(op, 0), 1.0)
+            self.assertAlmostEqual(
+                Dimensions._boolean_radius_at(op, 0, count) * math.cos(math.pi / count), 1.0)
 
     def assert_bottom(self, operator, truncated):
         inner = Dimensions._target_conic_inner_coordinate(operator)

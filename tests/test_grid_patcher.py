@@ -17,6 +17,7 @@ from src.grid_patcher import (_complete_triangles, _pentagon_corner, _slide_boun
                               _nearest_corrected, _right_angle_error, _refine_boundary,
                               _quad_rectangle_error, _t_shape_error, _turn, prepare_grid_steps,
                               _expand_triangle, _merge_collapsed_ring_edges, _tracked_loop)
+from src.visible_geometry import visible_bmesh_copy, hidden_boundary_vertices
 
 
 def clipped_grid():
@@ -55,6 +56,49 @@ def assert_clean(bm, expected_boundary):
     assert all(len(edge.link_faces) in {1, 2} for edge in bm.edges)
     assert len(expected_boundary) >= 3
     assert not any(name.startswith(".holey_grid_boundary") for name in bm.verts.layers.int.keys())
+
+
+# The Auto probe excludes hidden geometry. Its protected mask-boundary vertices
+# must nonetheless match replay, or an attached hidden triangle changes Step 1.
+for stage in ('DISSOLVE', 'PENTAGONS', 'SLIDE', 'REFINE', 'ROWS'):
+    bm, loop, edges = clipped_grid()
+    shared = next(vert for vert in loop if len(vert.link_edges) == 2)
+    a = bm.verts.new(shared.co + Vector((0, 0, 1)))
+    b = bm.verts.new(shared.co + Vector((1, 0, 1)))
+    hidden = bm.faces.new([shared, a, b])
+    hidden.hide = True
+    hidden_points = tuple(tuple(vert.co) for vert in hidden.verts)
+    trial, vertices, copied_edges, _faces = visible_bmesh_copy(bm)
+    protected = {vertices[v] for v in hidden_boundary_vertices(bm) if v in vertices}
+    errors, results = [], []
+    try:
+        for mesh, ring, rim, options in (
+            (trial, [vertices[v] for v in loop], [copied_edges[e] for e in edges],
+             dict(protected_vertices=protected)),
+            (bm, loop, edges, {}),
+        ):
+            try:
+                result = prepare_grid_steps(mesh, ring, rim, Matrix.Identity(4), stage,
+                                            refinement_passes=1, **options)
+            except grid_patcher.FairingError as error:
+                errors.append(str(error))
+            else:
+                results.append(result)
+        assert len(errors) in (0, 2), (stage, errors)
+        if errors:
+            assert errors[0] == errors[1], (stage, errors)
+        else:
+            assert results[0]['dissolved'] == results[1]['dissolved'] == 0
+            for key in ('merged', 'repaired', 'slid', 'mirrored', 'rows_filled'):
+                assert results[0].get(key) == results[1].get(key), (stage, key)
+            visible_shape = lambda mesh: sorted(tuple(sorted(tuple(v.co) for v in f.verts))
+                                                 for f in mesh.faces if not f.hide)
+            assert visible_shape(trial) == visible_shape(bm), stage
+        assert hidden.is_valid and hidden.hide
+        assert tuple(tuple(vert.co) for vert in hidden.verts) == hidden_points
+    finally:
+        trial.free()
+        bm.free()
 
 
 bm, loop, edges = clipped_grid()
@@ -843,9 +887,9 @@ def record_refinement(mesh, verts, rim, transform, locked, corners, passes=3,
     return counts
 
 
-def record_completion(*args):
+def record_completion(*args, **kwargs):
     assert events == ['PRE']
-    result = native_complete(*args)
+    result = native_complete(*args, **kwargs)
     if not result[3]:
         # Correcting neighboring T points can leave too little opening for the
         # full half-turn completion. Preserve the triangle rather than force an overlap.

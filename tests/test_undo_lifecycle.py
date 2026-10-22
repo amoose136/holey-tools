@@ -10,9 +10,10 @@ import bmesh
 import bpy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.operator import MESH_OT_holey_tools_resize_hole as Resize, _PersistentPreview
+from src.operator import MESH_OT_holey_tools_resize_hole as Resize
 from src.geometry import GeometryMixin
 from src.fairing import FairingError
+from tests.blender_support import capture_redo_source
 
 
 bpy.context.preferences.edit.use_global_undo = True
@@ -68,11 +69,7 @@ Resize._build_resize_projection_state(baseline, bm, wall)
 Resize._store_fit_for_redo(baseline)
 serialized = {key: value for key, value in vars(baseline).items()
               if not key.startswith('_') and key != 'report'}
-owner = object.__new__(_PersistentPreview)
-owner._draw_handle = None
-owner._source_object_name = obj.name
-(owner._source_mesh_name, owner._source_mesh, owner._source_bmesh,
- owner._source_materials) = _PersistentPreview._capture_canonical_source(baseline)
+owner = capture_redo_source(baseline)
 
 
 def fresh_state(obj, method, truncated):
@@ -127,6 +124,23 @@ with patch.object(GeometryMixin, '_boolean_cutter_geometry', side_effect=Fairing
         raise AssertionError('Expected reconstruction failure')
 assert obj.data.as_pointer() == mesh_pointer
 assert Resize._object_topology_signature(obj) == signature
+
+# Failure after native subtraction must also release the cutter/material tags
+# and roll back attributes and geometry without replacing the real mesh ID.
+before_resources = tuple({item.as_pointer() for item in collection}
+                         for collection in (bpy.data.objects, bpy.data.meshes, bpy.data.materials))
+op = fresh_state(obj, 'BOOLEAN', .8)
+with patch.object(GeometryMixin, '_cleanup_faired_boolean_surface', side_effect=RuntimeError('post-Boolean rollback probe')):
+    try:
+        Resize._apply_diameter_to_mesh(op, bpy.context, commit_boolean=True)
+    except FairingError as error:
+        assert 'post-Boolean rollback probe' in str(error)
+    else:
+        raise AssertionError('Expected post-Boolean failure')
+assert obj.mode == 'EDIT' and obj.data.as_pointer() == mesh_pointer
+assert Resize._object_topology_signature(obj) == signature
+assert before_resources == tuple({item.as_pointer() for item in collection}
+                                 for collection in (bpy.data.objects, bpy.data.meshes, bpy.data.materials))
 
 
 class MESH_OT_holey_undo_transition(bpy.types.Operator):

@@ -22,6 +22,7 @@ from src.operator import (  # noqa: E402
     _update_conic_truncated_depth,
     _update_diameter_estimator,
 )
+from tests.blender_support import capture_redo_source
 
 
 def evaluated_vertex_coordinates(obj):
@@ -1434,15 +1435,7 @@ MESH_OT_holey_tools_resize_hole._build_resize_projection_state(
 )
 MESH_OT_holey_tools_resize_hole._store_fit_for_redo(boolean_operator)
 boolean_operator.diameter = 3.0
-boolean_redo_source = object.__new__(_PersistentPreview)
-boolean_redo_source._draw_handle = None
-boolean_redo_source._source_object_name = boolean_object.name
-(
-    boolean_redo_source._source_mesh_name,
-    boolean_redo_source._source_mesh,
-    boolean_redo_source._source_bmesh,
-    boolean_redo_source._source_materials,
-) = _PersistentPreview._capture_canonical_source(boolean_operator)
+boolean_redo_source = capture_redo_source(boolean_operator)
 MESH_OT_holey_tools_resize_hole._apply_diameter_to_mesh(
     boolean_operator, bpy.context
 )
@@ -1462,6 +1455,7 @@ assert (
 )
 boolean_bmesh = bmesh.from_edit_mesh(boolean_object.data)
 assert all(len(edge.link_faces) == 2 for edge in boolean_bmesh.edges)
+preview_cutter_radius = MESH_OT_holey_tools_resize_hole._boolean_radius_at(boolean_operator, 0.0, 32)
 preview_angles = {
     (
         round(coordinate.x / math.hypot(coordinate.x, coordinate.y), 5),
@@ -1470,7 +1464,7 @@ preview_angles = {
     for coordinate in evaluated_vertex_coordinates(
         boolean_operator._boolean_preview_display_object
     )
-    if abs(math.hypot(coordinate.x, coordinate.y) - 1.5) < 1.0e-4
+    if abs(math.hypot(coordinate.x, coordinate.y) - preview_cutter_radius) < 1.0e-4
 }
 assert len(preview_angles) == 32, preview_angles
 assert boolean_operator._boolean_reconstruction_source is not None
@@ -1532,15 +1526,16 @@ assert all(len(edge.link_faces) == 2 for edge in boolean_bmesh.edges)
 minimum_radius = min(
     math.hypot(vert.co.x, vert.co.y) for vert in boolean_bmesh.verts
 )
-expected_apothem = 1.5 * math.cos(math.pi / boolean_operator.boolean_segments)
+expected_apothem = boolean_operator.diameter * .5
 assert abs(minimum_radius - expected_apothem) < 1.0e-4, minimum_radius
+final_cutter_radius = expected_apothem / math.cos(math.pi / boolean_operator.boolean_segments)
 final_angles = {
     (
         round(vert.co.x / math.hypot(vert.co.x, vert.co.y), 5),
         round(vert.co.y / math.hypot(vert.co.x, vert.co.y), 5),
     )
     for vert in boolean_bmesh.verts
-    if abs(math.hypot(vert.co.x, vert.co.y) - 1.5) < 1.0e-4
+    if abs(math.hypot(vert.co.x, vert.co.y) - final_cutter_radius) < 1.0e-4
 }
 assert len(final_angles) == 12, final_angles
 assert boolean_operator._boolean_preview_source is None
@@ -3191,11 +3186,7 @@ def prepare_auto_resize(obj, bm, faces):
     Resize._build_resize_projection_state(op, bm, faces)
     Resize._capture_deformation_state(op, bpy.context, bm, {vert for face in faces for vert in face.verts})
     Resize._store_fit_for_redo(op)
-    snapshot = object.__new__(_PersistentPreview)
-    snapshot._draw_handle = None
-    snapshot._source_object_name = obj.name
-    (snapshot._source_mesh_name, snapshot._source_mesh,
-     snapshot._source_bmesh, snapshot._source_materials) = _PersistentPreview._capture_canonical_source(op)
+    snapshot = capture_redo_source(op)
     return op, snapshot
 
 
@@ -3371,7 +3362,8 @@ for diameter in (0.8, 2.4, 3.4, 2.0):
         assert abs(math.hypot(vert.co.x, vert.co.y) - (2.0 + vert.co.z)) < 1.0e-5
     assert max(abs(vert.co.z) for vert in bm.verts[32:64]) < 1.0e-5
     for vert in bm.verts[128:192]:
-        assert abs(math.hypot(vert.co.x, vert.co.y) - diameter / 2.0) < 1.0e-5
+        target_vertex_radius = diameter / (2 * math.cos(math.pi / auto_bore_op.fit_angular_segments))
+        assert abs(math.hypot(vert.co.x, vert.co.y) - target_vertex_radius) < 1.0e-5
     assert max(abs(vert.co.z + 3.0) for vert in bm.verts[160:192]) < 1.0e-5
 auto_bore_source.remove()
 
@@ -3807,7 +3799,8 @@ bm = bmesh.from_edit_mesh(obj.data)
 bm.faces.ensure_lookup_table()
 bm.verts.ensure_lookup_table()
 assert all(abs(bm.faces[i].normal.z) < 1.0e-5 for i in range(96, 224))
-assert max(abs(math.hypot(v.co.x, v.co.y) - .8) for v in bm.verts[32:192]) < 1.0e-5
+target_vertex_radius = op.diameter / (2 * math.cos(math.pi / op.fit_angular_segments))
+assert max(abs(math.hypot(v.co.x, v.co.y) - target_vertex_radius) for v in bm.verts[32:192]) < 1.0e-5
 assert all(edge.is_manifold for edge in bm.edges)
 source.remove()
 
